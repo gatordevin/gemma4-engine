@@ -245,10 +245,15 @@ def chat_with_tools_streaming(messages_history, write_sse):
             messages.append({"role": "assistant", "content": m["content"]})
 
     write_sse({"type": "stream_start"})
-    t_start = time.time()
+    t_wall_start = time.time()
+
+    # Accumulate server-side timings across iterations
+    total_gen_tokens = 0
+    total_gen_ms = 0
+    total_prompt_tokens = 0
+    total_prompt_ms = 0
 
     for iteration in range(10):
-        # Call llama-server with tools
         payload = {
             "model": "gemma",
             "messages": messages,
@@ -278,10 +283,17 @@ def chat_with_tools_streaming(messages_history, write_sse):
         choice = result.get("choices", [{}])[0]
         message = choice.get("message", {})
         usage = result.get("usage", {})
+        timings = result.get("timings", {})
+
+        # Accumulate server-side timings (actual generation, no overhead)
+        total_gen_tokens += timings.get("predicted_n", 0)
+        total_gen_ms += timings.get("predicted_ms", 0)
+        total_prompt_tokens += timings.get("prompt_n", 0)
+        total_prompt_ms += timings.get("prompt_ms", 0)
+
         tc = message.get("tool_calls", [])
 
         if tc:
-            # Tool calls — execute and continue loop
             messages.append(message)
             for call in tc:
                 fn = call.get("function", {})
@@ -302,7 +314,7 @@ def chat_with_tools_streaming(messages_history, write_sse):
                 })
             continue
 
-        # No tool calls — final response. Stream it.
+        # Final response — stream it
         reasoning = message.get("reasoning_content", "")
         content = message.get("content", "")
 
@@ -316,16 +328,32 @@ def chat_with_tools_streaming(messages_history, write_sse):
                 if word.strip():
                     write_sse({"type": "token", "content": word + " "})
 
-        elapsed = time.time() - t_start
-        total_tok = usage.get("completion_tokens", 0)
-        gen_tps = total_tok / elapsed if elapsed > 0 else 0
+        # Use server-side timings for accurate speed measurement
+        wall_time = time.time() - t_wall_start
+        gen_tps = timings.get("predicted_per_second", 0)
+        prompt_tps = timings.get("prompt_per_second", 0)
 
-        write_sse({"type": "done", "usage": usage, "time": elapsed,
-                   "effective_tps": gen_tps, "accept_rate": 0})
+        # Cumulative across all iterations (tool calls + final)
+        cum_gen_tps = (total_gen_tokens / (total_gen_ms / 1000)) if total_gen_ms > 0 else 0
+
+        write_sse({"type": "done",
+                   "usage": usage,
+                   "time": wall_time,
+                   "gen_tps": gen_tps,
+                   "prompt_tps": prompt_tps,
+                   "cum_gen_tps": cum_gen_tps,
+                   "total_gen_tokens": total_gen_tokens,
+                   "total_gen_ms": total_gen_ms,
+                   "total_prompt_tokens": total_prompt_tokens,
+                   "total_prompt_ms": total_prompt_ms,
+                   })
         return
 
     # Max iterations
-    write_sse({"type": "done", "usage": {}, "time": time.time() - t_start})
+    wall_time = time.time() - t_wall_start
+    cum_gen_tps = (total_gen_tokens / (total_gen_ms / 1000)) if total_gen_ms > 0 else 0
+    write_sse({"type": "done", "usage": {}, "time": wall_time,
+               "cum_gen_tps": cum_gen_tps, "total_gen_tokens": total_gen_tokens})
 
 
 def check_auth(cookie_header):
@@ -430,14 +458,14 @@ input[type=file] { display: none; }
   <div class="info">MoE 128e/8a | Q4_K_M | 54 t/s | Vision | Tools</div>
 </div>
 <div class="metrics" id="metrics">
-  <div class="metric"><span class="metric-label">Speed:</span><span class="metric-value" id="m-gen">-</span></div>
-  <div class="metric"><span class="metric-label">Effective:</span><span class="metric-value" id="m-eff" style="color:var(--yellow)">-</span></div>
-  <div class="metric"><span class="metric-label">Accept:</span><span class="metric-value" id="m-accept">-</span></div>
+  <div class="metric"><span class="metric-label">Gen Speed:</span><span class="metric-value" id="m-gen">-</span></div>
+  <div class="metric"><span class="metric-label">Prompt:</span><span class="metric-value" id="m-prompt">-</span></div>
   <div class="metric"><span class="metric-label">Reasoning:</span><span class="metric-value yellow" id="m-reason">-</span></div>
   <div class="metric"><span class="metric-label">Completion:</span><span class="metric-value" id="m-comp">-</span></div>
   <div class="metric"><span class="metric-label">Tools:</span><span class="metric-value" id="m-tools">0</span></div>
-  <div class="metric"><span class="metric-label">Tokens:</span><span class="metric-value" id="m-total">-</span></div>
-  <div class="metric"><span class="metric-label">Time:</span><span class="metric-value" id="m-time">-</span></div>
+  <div class="metric"><span class="metric-label">Gen Tokens:</span><span class="metric-value" id="m-total">-</span></div>
+  <div class="metric"><span class="metric-label">Gen Time:</span><span class="metric-value" id="m-gentime">-</span></div>
+  <div class="metric"><span class="metric-label">Wall:</span><span class="metric-value" id="m-time" style="color:var(--dim)">-</span></div>
 </div>
 <div class="main">
   <div class="sidebar" id="sidebar"></div>
@@ -664,20 +692,23 @@ async function send() {
             renderChat();
           }
           else if (evt.type === 'done') {
-            const u = evt.usage || {};
-            if (u.completion_tokens) {
-              tokenCount = u.completion_tokens;
-              document.getElementById('m-total').textContent = tokenCount;
+            // Server-side timings (actual generation, no overhead)
+            if (evt.gen_tps) {
+              document.getElementById('m-gen').textContent = evt.gen_tps.toFixed(1) + ' t/s';
+            } else if (evt.cum_gen_tps) {
+              document.getElementById('m-gen').textContent = evt.cum_gen_tps.toFixed(1) + ' t/s';
             }
-            const totalElapsed = (performance.now() - t0) / 1000;
-            document.getElementById('m-time').textContent = totalElapsed.toFixed(1) + 's';
-            document.getElementById('m-gen').textContent = totalElapsed > 0.1 ? (tokenCount / totalElapsed).toFixed(0) + ' t/s' : '-';
-            if (evt.effective_tps) {
-              document.getElementById('m-eff').textContent = evt.effective_tps.toFixed(0) + ' t/s';
+            if (evt.prompt_tps) {
+              document.getElementById('m-prompt').textContent = evt.prompt_tps.toFixed(0) + ' t/s';
             }
-            if (evt.accept_rate) {
-              document.getElementById('m-accept').textContent = evt.accept_rate.toFixed(1) + '%';
+            if (evt.total_gen_tokens) {
+              document.getElementById('m-total').textContent = evt.total_gen_tokens;
             }
+            if (evt.total_gen_ms) {
+              document.getElementById('m-gentime').textContent = (evt.total_gen_ms / 1000).toFixed(1) + 's';
+            }
+            const wallTime = (performance.now() - t0) / 1000;
+            document.getElementById('m-time').textContent = wallTime.toFixed(1) + 's';
             if (toolCount > 0) loadTree();
             reader.cancel();
             busy = false;

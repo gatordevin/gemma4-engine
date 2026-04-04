@@ -28,6 +28,29 @@ AUTH_TOKEN = os.environ.get("AUTH_TOKEN", None)
 PORT = int(os.environ.get("CHAT_PORT", "8080"))
 WORKDIR = os.environ.get("WORKDIR", os.path.expanduser("~/projects"))
 
+# Lookup decoding engine
+LLAMA_CPP = os.environ.get("LLAMA_CPP", os.path.expanduser("~/llama.cpp"))
+MODEL_PATH = os.environ.get("MODEL", os.path.expanduser("~/models/gemma-4-26B-A4B-it-Q4_K_M.gguf"))
+LOOKUP_CACHE = os.environ.get("LOOKUP_CACHE", os.path.expanduser("~/models/lookup_session.bin"))
+LOOKUP_BIN = os.path.join(LLAMA_CPP, "build-hip-fast/bin/llama-lookup")
+if not os.path.exists(LOOKUP_BIN):
+    LOOKUP_BIN = os.path.join(LLAMA_CPP, "build/bin/llama-lookup")
+USE_LOOKUP = os.path.exists(LOOKUP_BIN)
+
+# Gemma 4 native tool call pattern
+# Match tool calls: greedy .+ captures everything, then backtracks to find )<tool_call|>
+NATIVE_TOOL_RE = re.compile(r'<\|tool_call\>call:(\w+)\((.+)\)<tool_call\|>')
+
+TOOL_PROMPT = """You have access to these tools:
+- bash(command: str): Execute a shell command and return output.
+- read_file(path: str): Read a file's contents.
+- write_file(path: str, content: str): Write content to a file.
+- edit_file(path: str, old_string: str, new_string: str): Replace text in a file.
+- list_files(path: str, depth: int): List directory contents.
+
+Use tools when needed. Wait for results before continuing.
+Always use tools to create/modify files when asked to write code."""
+
 if not AUTH_TOKEN:
     AUTH_TOKEN = secrets.token_urlsafe(48)
     print(f"\n  Generated AUTH_TOKEN: {AUTH_TOKEN}\n")
@@ -174,7 +197,7 @@ def exec_tool(name, args):
 
         elif name == "list_files":
             dpath = resolve_path(args.get("path", ""))
-            depth = min(args.get("depth", 3), 5)
+            depth = min(int(args.get("depth", 3)), 5)
             lines = []
             for root, dirs, files in os.walk(dpath):
                 level = root.replace(dpath, "").count(os.sep)
@@ -220,113 +243,192 @@ def get_file_tree(path=WORKDIR, depth=3):
     return walk(path, depth)
 
 
-def build_api_messages(messages_history):
-    """Convert frontend messages to API format."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+def format_lookup_prompt(messages_history):
+    """Format messages into Gemma 4 chat template for llama-lookup."""
+    sys = f"You are a helpful coding assistant. Working directory: {WORKDIR}\n{TOOL_PROMPT}"
+    parts = [f"<bos><|turn>system\n{sys}<turn|>"]
     for m in messages_history:
-        if m["role"] == "user":
-            if m.get("image"):
-                messages.append({"role": "user", "content": [
-                    {"type": "text", "text": m["content"]},
-                    {"type": "image_url", "image_url": {"url": m["image"]}}
-                ]})
-            else:
-                messages.append({"role": "user", "content": m["content"]})
-        elif m["role"] == "assistant":
-            # Skip empty placeholders, include messages with content or reasoning
-            content = m.get("content", "")
-            reasoning = m.get("reasoning", "")
-            if content or reasoning:
-                messages.append({"role": "assistant", "content": content or reasoning})
-    return messages
+        role = m.get("role", "")
+        content = m.get("content", "")
+        if not content:
+            continue
+        if role == "user":
+            parts.append(f"<|turn>user\n{content}<turn|>")
+        elif role == "assistant":
+            parts.append(f"<|turn>model\n{content}<turn|>")
+        elif role == "tool_result":
+            parts.append(f"<|turn>user\n[Tool Result]\n{content}<turn|>")
+    parts.append("<|turn>model\n")
+    return "\n".join(parts)
 
 
-def call_model(messages, stream=False):
-    """Call llama-server. Returns parsed JSON or raw response for streaming."""
-    payload = {
-        "model": "gemma",
-        "messages": messages,
-        "max_tokens": 4096,
-        "temperature": 0.3,
-        "tools": TOOLS,
-        "stream": stream,
-    }
-    req = Request(
-        f"{LLAMA_API}/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    return urlopen(req, timeout=180)
+def parse_tool_args(args_str):
+    """Parse tool arguments from Gemma's native format."""
+    try:
+        return json.loads("{" + args_str + "}")
+    except json.JSONDecodeError:
+        args = {}
+        for kv in re.finditer(r'(\w+)\s*[=:]\s*(?:"([^"]*?)"|\'([^\']*?)\'|(\S+?)(?:\s*[,\)\}]|$))', args_str):
+            args[kv.group(1)] = kv.group(2) or kv.group(3) or kv.group(4) or ""
+        return args
+
+
+def clean_output(text):
+    """Remove Gemma special tokens from output."""
+    for tok in ['<bos>', '<turn|>', '<|turn>', '<channel|>', '<|channel>',
+                '<|channel', '<tool_call|>', '<|tool_call>', '<|tool_response>',
+                '<tool_response>', 'channel|>', '|>']:
+        text = text.replace(tok, '')
+    # Remove thinking markers
+    text = re.sub(r'(?:^|\n)\s*(?:l?thought|l?pip)\s*\n', '\n', text)
+    # Remove trailing turn markers
+    text = re.sub(r'<turn\|?\>.*$', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
+def split_thinking_content(text):
+    """Separate thinking/reasoning from content."""
+    thinking = ""
+    content = text
+    # Gemma wraps thinking in <channel>thought ... <channel|> or similar
+    think_patterns = [
+        r'thought\s*\n(.*?)(?=\n\S|\Z)',
+    ]
+    for pat in think_patterns:
+        m = re.search(pat, content, re.DOTALL)
+        if m:
+            thinking = m.group(1).strip()
+            content = content[:m.start()] + content[m.end():]
+
+    return thinking, content.strip()
 
 
 def chat_with_tools_streaming(messages_history, write_sse):
-    """Stream response via SSE. Uses non-streaming for tool detection, streaming for final."""
-    messages = build_api_messages(messages_history)
-    total_usage = {}
+    """Stream response via lookup decoding with tool calling."""
+    if not USE_LOOKUP:
+        write_sse({"type": "error", "content": "llama-lookup binary not found"})
+        return
 
-    for iteration in range(10):
-        t0 = time.time()
+    conversation = []
+    for m in messages_history:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        if role == "user" and content:
+            conversation.append({"role": "user", "content": content})
+        elif role == "assistant" and content:
+            conversation.append({"role": "assistant", "content": content})
+
+    write_sse({"type": "stream_start"})
+    t_start = time.time()
+    char_count = 0
+    all_stats = {}
+
+    for iteration in range(8):
+        prompt = format_lookup_prompt(conversation)
+        prompt_len = len(prompt)
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
 
         try:
-            # Log message structure for debugging
-            msg_summary = [(m.get("role"), "image" if isinstance(m.get("content"), list) else str(m.get("content",""))[:50]) for m in messages]
-            print(f"[INFO] Iter {iteration}, messages: {msg_summary}", flush=True)
+            cmd = [
+                LOOKUP_BIN, "-m", MODEL_PATH,
+                "-ngl", "99", "-t", "16",
+                "-lcd", LOOKUP_CACHE, "--draft", "16",
+                "--temp", "0.3",
+                "-f", prompt_file, "-n", "4096",
+            ]
 
-            # Always use non-streaming first (simpler, more reliable)
-            resp = call_model(messages, stream=False)
-            result = json.loads(resp.read())
-        except Exception as e:
-            err_body = ""
-            if hasattr(e, 'read'):
-                try: err_body = e.read().decode()[:500]
-                except: pass
-            print(f"[ERROR] {e} | {err_body}", flush=True)
-            write_sse({"type": "error", "content": str(e)[:200]})
-            return
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
-        elapsed = time.time() - t0
-        choice = result.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        total_usage = result.get("usage", total_usage)
-        tc = message.get("tool_calls", [])
+            raw_buf = ""
+            skipped = 0
+            tool_found = False
 
-        if not tc:
-            # No tool calls — send the response
-            write_sse({"type": "stream_start"})
-            reasoning = message.get("reasoning_content", "")
-            content = message.get("content", "")
-            if reasoning:
-                # Send reasoning in small chunks to simulate streaming
-                for word in reasoning.split(" "):
-                    write_sse({"type": "reasoning_token", "content": word + " "})
+            # Capture all output from llama-lookup
+            while True:
+                char = proc.stdout.read(1)
+                if not char:
+                    break
+                skipped += 1
+                if skipped <= prompt_len:
+                    continue
+                raw_buf += char
+
+                # Check for tool call mid-generation
+                if '<tool_call|>' in raw_buf:
+                    tool_match = NATIVE_TOOL_RE.search(raw_buf)
+                    if tool_match:
+                        proc.kill()
+                        proc.wait()
+
+                        tool_name = tool_match.group(1)
+                        tool_args = parse_tool_args(tool_match.group(2))
+                        tool_result = exec_tool(tool_name, tool_args)
+
+                        write_sse({"type": "tool_exec", "tool": tool_name,
+                                   "args": tool_args, "result": tool_result[:2000]})
+
+                        pre_text = clean_output(raw_buf[:tool_match.start()])
+                        conversation.append({"role": "assistant", "content": f"{pre_text}\n[Called {tool_name}]"})
+                        conversation.append({"role": "tool_result", "content": tool_result})
+                        tool_found = True
+                        break
+
+            if tool_found:
+                continue  # Restart generation with tool result
+
+            # Generation complete — clean and stream the result word by word
+            proc.wait()
+            cleaned = clean_output(raw_buf)
+            thinking, content = split_thinking_content(cleaned)
+            char_count = len(raw_buf)
+
+            # Stream reasoning tokens rapidly
+            if thinking:
+                for word in thinking.split(" "):
+                    if word.strip():
+                        write_sse({"type": "reasoning_token", "content": word + " "})
+
+            # Stream content tokens rapidly
             if content:
                 for word in content.split(" "):
-                    write_sse({"type": "token", "content": word + " "})
-            write_sse({"type": "done", "usage": total_usage, "time": elapsed})
+                    if word.strip():
+                        write_sse({"type": "token", "content": word + " "})
+
+            # Read stats from stderr
+            stderr = proc.stderr.read()
+            for line in stderr.split("\n"):
+                if "total time" in line:
+                    m = re.search(r"total time =\s+([\d.]+) ms /\s+(\d+)", line)
+                    if m:
+                        all_stats["total_ms"] = float(m.group(1))
+                        all_stats["total_tokens"] = int(m.group(2))
+                if "accept" in line:
+                    m = re.search(r"accept\s+=\s+([\d.]+)", line)
+                    if m:
+                        all_stats["accept_rate"] = float(m.group(1))
+
+            # Done
+            elapsed = time.time() - t_start
+            eff_tps = all_stats.get("total_tokens", 0) / (all_stats.get("total_ms", 1) / 1000) if all_stats.get("total_ms") else 0
+            usage = {"completion_tokens": all_stats.get("total_tokens", char_count)}
+            write_sse({"type": "done", "usage": usage, "time": elapsed,
+                       "accept_rate": all_stats.get("accept_rate", 0),
+                       "effective_tps": eff_tps})
             return
 
-        # Tool calls — execute and loop
-        messages.append(message)
-        for call in tc:
-            fn = call.get("function", {})
-            tool_name = fn.get("name", "")
-            try:
-                tool_args = json.loads(fn.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                tool_args = {}
+        finally:
+            os.unlink(prompt_file)
 
-            tool_result = exec_tool(tool_name, tool_args)
-            write_sse({"type": "tool_exec", "tool": tool_name, "args": tool_args,
-                       "result": tool_result[:2000]})
+        # If we got here via break (tool call), continue the loop
+        continue
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.get("id", ""),
-                "content": tool_result
-            })
-
-    write_sse({"type": "done", "usage": total_usage, "time": 0})
+    # Max iterations
+    elapsed = time.time() - t_start
+    write_sse({"type": "done", "usage": {"completion_tokens": char_count}, "time": elapsed})
 
 
 def check_auth(cookie_header):
@@ -428,15 +530,16 @@ input[type=file] { display: none; }
 <body>
 <div class="header">
   <h1>Gemma 4 26B-A4B</h1>
-  <div class="info">MoE 128 experts, 8 active | Q4_K_M | Vision | Tools</div>
+  <div class="info">MoE 128e/8a | Q4_K_M | Lookup Decoding ~230t/s | Tools</div>
 </div>
 <div class="metrics" id="metrics">
-  <div class="metric"><span class="metric-label">Gen:</span><span class="metric-value" id="m-gen">-</span></div>
-  <div class="metric"><span class="metric-label">TTFT:</span><span class="metric-value" id="m-ttft">-</span></div>
+  <div class="metric"><span class="metric-label">Speed:</span><span class="metric-value" id="m-gen">-</span></div>
+  <div class="metric"><span class="metric-label">Effective:</span><span class="metric-value" id="m-eff" style="color:var(--yellow)">-</span></div>
+  <div class="metric"><span class="metric-label">Accept:</span><span class="metric-value" id="m-accept">-</span></div>
   <div class="metric"><span class="metric-label">Reasoning:</span><span class="metric-value yellow" id="m-reason">-</span></div>
   <div class="metric"><span class="metric-label">Completion:</span><span class="metric-value" id="m-comp">-</span></div>
   <div class="metric"><span class="metric-label">Tools:</span><span class="metric-value" id="m-tools">0</span></div>
-  <div class="metric"><span class="metric-label">Total:</span><span class="metric-value" id="m-total">-</span></div>
+  <div class="metric"><span class="metric-label">Tokens:</span><span class="metric-value" id="m-total">-</span></div>
   <div class="metric"><span class="metric-label">Time:</span><span class="metric-value" id="m-time">-</span></div>
 </div>
 <div class="main">
@@ -667,17 +770,18 @@ async function send() {
             const u = evt.usage || {};
             if (u.completion_tokens) {
               tokenCount = u.completion_tokens;
-              document.getElementById('m-total').textContent = tokenCount + ' tok';
-            }
-            if (genStart) {
-              const genElapsed = (performance.now() - genStart) / 1000;
-              document.getElementById('m-gen').textContent = genElapsed > 0.1 ? (tokenCount / genElapsed).toFixed(1) + ' t/s' : '-';
-              document.getElementById('m-ttft').textContent = ((genStart - t0) / 1000).toFixed(1) + 's';
+              document.getElementById('m-total').textContent = tokenCount;
             }
             const totalElapsed = (performance.now() - t0) / 1000;
             document.getElementById('m-time').textContent = totalElapsed.toFixed(1) + 's';
+            document.getElementById('m-gen').textContent = totalElapsed > 0.1 ? (tokenCount / totalElapsed).toFixed(0) + ' t/s' : '-';
+            if (evt.effective_tps) {
+              document.getElementById('m-eff').textContent = evt.effective_tps.toFixed(0) + ' t/s';
+            }
+            if (evt.accept_rate) {
+              document.getElementById('m-accept').textContent = evt.accept_rate.toFixed(1) + '%';
+            }
             if (toolCount > 0) loadTree();
-            // CRITICAL: break out of the reader loop
             reader.cancel();
             busy = false;
             document.getElementById('send-btn').disabled = false;

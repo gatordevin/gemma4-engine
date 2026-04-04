@@ -28,28 +28,8 @@ AUTH_TOKEN = os.environ.get("AUTH_TOKEN", None)
 PORT = int(os.environ.get("CHAT_PORT", "8080"))
 WORKDIR = os.environ.get("WORKDIR", os.path.expanduser("~/projects"))
 
-# Lookup decoding engine
-LLAMA_CPP = os.environ.get("LLAMA_CPP", os.path.expanduser("~/llama.cpp"))
-MODEL_PATH = os.environ.get("MODEL", os.path.expanduser("~/models/gemma-4-26B-A4B-it-Q4_K_M.gguf"))
-LOOKUP_CACHE = os.environ.get("LOOKUP_CACHE", os.path.expanduser("~/models/lookup_session.bin"))
-LOOKUP_BIN = os.path.join(LLAMA_CPP, "build-hip-fast/bin/llama-lookup")
-if not os.path.exists(LOOKUP_BIN):
-    LOOKUP_BIN = os.path.join(LLAMA_CPP, "build/bin/llama-lookup")
-USE_LOOKUP = os.path.exists(LOOKUP_BIN)
 
-# Gemma 4 native tool call pattern
-# Match tool calls: greedy .+ captures everything, then backtracks to find )<tool_call|>
-NATIVE_TOOL_RE = re.compile(r'<\|tool_call\>call:(\w+)\((.+)\)<tool_call\|>')
 
-TOOL_PROMPT = """You have access to these tools:
-- bash(command: str): Execute a shell command and return output.
-- read_file(path: str): Read a file's contents.
-- write_file(path: str, content: str): Write content to a file.
-- edit_file(path: str, old_string: str, new_string: str): Replace text in a file.
-- list_files(path: str, depth: int): List directory contents.
-
-Use tools when needed. Wait for results before continuing.
-Always use tools to create/modify files when asked to write code."""
 
 if not AUTH_TOKEN:
     AUTH_TOKEN = secrets.token_urlsafe(48)
@@ -243,192 +223,109 @@ def get_file_tree(path=WORKDIR, depth=3):
     return walk(path, depth)
 
 
-def format_lookup_prompt(messages_history):
-    """Format messages into Gemma 4 chat template for llama-lookup."""
-    sys = f"You are a helpful coding assistant. Working directory: {WORKDIR}\n{TOOL_PROMPT}"
-    parts = [f"<bos><|turn>system\n{sys}<turn|>"]
-    for m in messages_history:
-        role = m.get("role", "")
-        content = m.get("content", "")
-        if not content:
-            continue
-        if role == "user":
-            parts.append(f"<|turn>user\n{content}<turn|>")
-        elif role == "assistant":
-            parts.append(f"<|turn>model\n{content}<turn|>")
-        elif role == "tool_result":
-            parts.append(f"<|turn>user\n[Tool Result]\n{content}<turn|>")
-    parts.append("<|turn>model\n")
-    return "\n".join(parts)
-
-
-def parse_tool_args(args_str):
-    """Parse tool arguments from Gemma's native format."""
-    try:
-        return json.loads("{" + args_str + "}")
-    except json.JSONDecodeError:
-        args = {}
-        for kv in re.finditer(r'(\w+)\s*[=:]\s*(?:"([^"]*?)"|\'([^\']*?)\'|(\S+?)(?:\s*[,\)\}]|$))', args_str):
-            args[kv.group(1)] = kv.group(2) or kv.group(3) or kv.group(4) or ""
-        return args
-
-
-def clean_output(text):
-    """Remove Gemma special tokens from output."""
-    for tok in ['<bos>', '<turn|>', '<|turn>', '<channel|>', '<|channel>',
-                '<|channel', '<tool_call|>', '<|tool_call>', '<|tool_response>',
-                '<tool_response>', 'channel|>', '|>']:
-        text = text.replace(tok, '')
-    # Remove thinking markers
-    text = re.sub(r'(?:^|\n)\s*(?:l?thought|l?pip)\s*\n', '\n', text)
-    # Remove trailing turn markers
-    text = re.sub(r'<turn\|?\>.*$', '', text, flags=re.DOTALL)
-    return text.strip()
-
-
-def split_thinking_content(text):
-    """Separate thinking/reasoning from content."""
-    thinking = ""
-    content = text
-    # Gemma wraps thinking in <channel>thought ... <channel|> or similar
-    think_patterns = [
-        r'thought\s*\n(.*?)(?=\n\S|\Z)',
-    ]
-    for pat in think_patterns:
-        m = re.search(pat, content, re.DOTALL)
-        if m:
-            thinking = m.group(1).strip()
-            content = content[:m.start()] + content[m.end():]
-
-    return thinking, content.strip()
-
-
 def chat_with_tools_streaming(messages_history, write_sse):
-    """Stream response via lookup decoding with tool calling."""
-    if not USE_LOOKUP:
-        write_sse({"type": "error", "content": "llama-lookup binary not found"})
-        return
+    """Robust tool calling via llama-server API + streaming final response.
 
-    conversation = []
+    Uses llama-server's native tool calling (reliable, handles all edge cases)
+    at 54 t/s with the A4B MoE model. Tool calls are executed in a loop,
+    final text response is streamed word-by-word to the browser.
+    """
+    # Build API messages
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in messages_history:
-        role = m.get("role", "")
-        content = m.get("content", "")
-        if role == "user" and content:
-            conversation.append({"role": "user", "content": content})
-        elif role == "assistant" and content:
-            conversation.append({"role": "assistant", "content": content})
+        if m.get("role") == "user" and m.get("content"):
+            if m.get("image"):
+                messages.append({"role": "user", "content": [
+                    {"type": "text", "text": m["content"]},
+                    {"type": "image_url", "image_url": {"url": m["image"]}}
+                ]})
+            else:
+                messages.append({"role": "user", "content": m["content"]})
+        elif m.get("role") == "assistant" and m.get("content"):
+            messages.append({"role": "assistant", "content": m["content"]})
 
     write_sse({"type": "stream_start"})
     t_start = time.time()
-    char_count = 0
-    all_stats = {}
 
-    for iteration in range(8):
-        prompt = format_lookup_prompt(conversation)
-        prompt_len = len(prompt)
-
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            f.write(prompt)
-            prompt_file = f.name
+    for iteration in range(10):
+        # Call llama-server with tools
+        payload = {
+            "model": "gemma",
+            "messages": messages,
+            "max_tokens": 4096,
+            "temperature": 0.3,
+            "tools": TOOLS,
+            "stream": False,
+        }
 
         try:
-            cmd = [
-                LOOKUP_BIN, "-m", MODEL_PATH,
-                "-ngl", "99", "-t", "16",
-                "-lcd", LOOKUP_CACHE, "--draft", "16",
-                "--temp", "0.3",
-                "-f", prompt_file, "-n", "4096",
-            ]
-
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-
-            raw_buf = ""
-            skipped = 0
-            tool_found = False
-
-            # Capture all output from llama-lookup
-            while True:
-                char = proc.stdout.read(1)
-                if not char:
-                    break
-                skipped += 1
-                if skipped <= prompt_len:
-                    continue
-                raw_buf += char
-
-                # Check for tool call mid-generation
-                if '<tool_call|>' in raw_buf:
-                    tool_match = NATIVE_TOOL_RE.search(raw_buf)
-                    if tool_match:
-                        proc.kill()
-                        proc.wait()
-
-                        tool_name = tool_match.group(1)
-                        tool_args = parse_tool_args(tool_match.group(2))
-                        tool_result = exec_tool(tool_name, tool_args)
-
-                        write_sse({"type": "tool_exec", "tool": tool_name,
-                                   "args": tool_args, "result": tool_result[:2000]})
-
-                        pre_text = clean_output(raw_buf[:tool_match.start()])
-                        conversation.append({"role": "assistant", "content": f"{pre_text}\n[Called {tool_name}]"})
-                        conversation.append({"role": "tool_result", "content": tool_result})
-                        tool_found = True
-                        break
-
-            if tool_found:
-                continue  # Restart generation with tool result
-
-            # Generation complete — clean and stream the result word by word
-            proc.wait()
-            cleaned = clean_output(raw_buf)
-            thinking, content = split_thinking_content(cleaned)
-            char_count = len(raw_buf)
-
-            # Stream reasoning tokens rapidly
-            if thinking:
-                for word in thinking.split(" "):
-                    if word.strip():
-                        write_sse({"type": "reasoning_token", "content": word + " "})
-
-            # Stream content tokens rapidly
-            if content:
-                for word in content.split(" "):
-                    if word.strip():
-                        write_sse({"type": "token", "content": word + " "})
-
-            # Read stats from stderr
-            stderr = proc.stderr.read()
-            for line in stderr.split("\n"):
-                if "total time" in line:
-                    m = re.search(r"total time =\s+([\d.]+) ms /\s+(\d+)", line)
-                    if m:
-                        all_stats["total_ms"] = float(m.group(1))
-                        all_stats["total_tokens"] = int(m.group(2))
-                if "accept" in line:
-                    m = re.search(r"accept\s+=\s+([\d.]+)", line)
-                    if m:
-                        all_stats["accept_rate"] = float(m.group(1))
-
-            # Done
-            elapsed = time.time() - t_start
-            eff_tps = all_stats.get("total_tokens", 0) / (all_stats.get("total_ms", 1) / 1000) if all_stats.get("total_ms") else 0
-            usage = {"completion_tokens": all_stats.get("total_tokens", char_count)}
-            write_sse({"type": "done", "usage": usage, "time": elapsed,
-                       "accept_rate": all_stats.get("accept_rate", 0),
-                       "effective_tps": eff_tps})
+            req = Request(
+                f"{LLAMA_API}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            resp = urlopen(req, timeout=180)
+            result = json.loads(resp.read())
+        except Exception as e:
+            err_body = ""
+            if hasattr(e, 'read'):
+                try: err_body = e.read().decode()[:300]
+                except: pass
+            write_sse({"type": "error", "content": f"Model error: {e} {err_body}"})
             return
 
-        finally:
-            os.unlink(prompt_file)
+        choice = result.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        usage = result.get("usage", {})
+        tc = message.get("tool_calls", [])
 
-        # If we got here via break (tool call), continue the loop
-        continue
+        if tc:
+            # Tool calls — execute and continue loop
+            messages.append(message)
+            for call in tc:
+                fn = call.get("function", {})
+                tool_name = fn.get("name", "")
+                try:
+                    tool_args = json.loads(fn.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                tool_result = exec_tool(tool_name, tool_args)
+                write_sse({"type": "tool_exec", "tool": tool_name,
+                           "args": tool_args, "result": tool_result[:2000]})
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": tool_result
+                })
+            continue
+
+        # No tool calls — final response. Stream it.
+        reasoning = message.get("reasoning_content", "")
+        content = message.get("content", "")
+
+        if reasoning:
+            for word in reasoning.split(" "):
+                if word.strip():
+                    write_sse({"type": "reasoning_token", "content": word + " "})
+
+        if content:
+            for word in content.split(" "):
+                if word.strip():
+                    write_sse({"type": "token", "content": word + " "})
+
+        elapsed = time.time() - t_start
+        total_tok = usage.get("completion_tokens", 0)
+        gen_tps = total_tok / elapsed if elapsed > 0 else 0
+
+        write_sse({"type": "done", "usage": usage, "time": elapsed,
+                   "effective_tps": gen_tps, "accept_rate": 0})
+        return
 
     # Max iterations
-    elapsed = time.time() - t_start
-    write_sse({"type": "done", "usage": {"completion_tokens": char_count}, "time": elapsed})
+    write_sse({"type": "done", "usage": {}, "time": time.time() - t_start})
 
 
 def check_auth(cookie_header):
@@ -530,7 +427,7 @@ input[type=file] { display: none; }
 <body>
 <div class="header">
   <h1>Gemma 4 26B-A4B</h1>
-  <div class="info">MoE 128e/8a | Q4_K_M | Lookup Decoding ~230t/s | Tools</div>
+  <div class="info">MoE 128e/8a | Q4_K_M | 54 t/s | Vision | Tools</div>
 </div>
 <div class="metrics" id="metrics">
   <div class="metric"><span class="metric-label">Speed:</span><span class="metric-value" id="m-gen">-</span></div>

@@ -495,13 +495,30 @@ function readFile(path) {
 function handleImage(input) {
   const file = input.files[0];
   if (!file) return;
+  // Resize and compress image to fit model constraints
+  const img = new Image();
   const reader = new FileReader();
   reader.onload = () => {
-    pendingImage = reader.result;
-    document.getElementById('img-preview').style.display = 'block';
-    document.getElementById('img-preview').innerHTML =
-      `&#128247; ${file.name} (${(file.size/1024).toFixed(0)}KB) <button class="btn-secondary"
-       style="padding:2px 6px;font-size:10px" onclick="pendingImage=null;this.parentElement.style.display='none'">x</button>`;
+    img.onload = () => {
+      const MAX = 768;
+      let w = img.width, h = img.height;
+      if (w > MAX || h > MAX) {
+        const scale = MAX / Math.max(w, h);
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      pendingImage = canvas.toDataURL('image/jpeg', 0.85);
+      const sizeKB = Math.round(pendingImage.length * 3 / 4 / 1024);
+      document.getElementById('img-preview').style.display = 'block';
+      document.getElementById('img-preview').innerHTML =
+        `&#128247; ${file.name} (${w}x${h}, ${sizeKB}KB) <button class="btn-secondary"
+         style="padding:2px 6px;font-size:10px" onclick="pendingImage=null;this.parentElement.style.display='none'">x</button>`;
+    };
+    img.src = reader.result;
   };
   reader.readAsDataURL(file);
   input.value = '';

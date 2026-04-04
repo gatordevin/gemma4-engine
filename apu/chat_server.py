@@ -1,46 +1,312 @@
 #!/usr/bin/env python3
 """
-Gemma 4 A4B — Web Chat Server with Real-Time Metrics
+Gemma 4 A4B — Web IDE Chat Server
 
-Authenticated web interface for chatting with the local Gemma 4 model.
-Shows live speed metrics: prompt eval, reasoning tokens, generation speed,
-cache utilization, and token breakdown.
+Authenticated web interface with:
+- Chat with real-time metrics
+- Image upload (vision)
+- File browser / project tree
+- Tool calling: bash, read, write, edit files
+- Agentic loop: model can chain tool calls
 
 Usage:
-  AUTH_TOKEN=your-long-secure-password python3 chat_server.py
-  # Then open http://localhost:8080 in your browser
+  AUTH_TOKEN=your-token WORKDIR=/path/to/project python3 chat_server.py
 
-Requires the llama-server running on LLAMA_API (default http://localhost:8082)
+Requires llama-server running on LLAMA_API (default http://localhost:8082)
 """
 
-import os
-import json
-import time
-import hashlib
-import secrets
-import asyncio
+import os, sys, json, time, secrets, subprocess, base64, mimetypes, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
-import ssl
+from pathlib import Path
 import threading
 
-# Config
 LLAMA_API = os.environ.get("LLAMA_API", "http://localhost:8082")
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", None)
 PORT = int(os.environ.get("CHAT_PORT", "8080"))
-SESSION_SECRET = secrets.token_hex(32)
+WORKDIR = os.environ.get("WORKDIR", os.path.expanduser("~/projects"))
 
 if not AUTH_TOKEN:
     AUTH_TOKEN = secrets.token_urlsafe(48)
-    print(f"\n{'='*60}")
-    print(f"  No AUTH_TOKEN set. Generated one:")
-    print(f"  {AUTH_TOKEN}")
-    print(f"{'='*60}\n")
+    print(f"\n  Generated AUTH_TOKEN: {AUTH_TOKEN}\n")
 
-# Simple session store
+Path(WORKDIR).mkdir(parents=True, exist_ok=True)
+
 valid_sessions = set()
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a shell command and return its output. Use for running code, installing packages, git operations, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The bash command to execute"}
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file. Returns the file content as text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "content": {"type": "string", "description": "The content to write"}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace a specific string in a file with new content. The old_string must match exactly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "old_string": {"type": "string", "description": "The exact string to find and replace"},
+                    "new_string": {"type": "string", "description": "The replacement string"}
+                },
+                "required": ["path", "old_string", "new_string"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files and directories in a path. Returns a tree structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path (default: project root)"},
+                    "depth": {"type": "integer", "description": "Max depth (default: 3)"}
+                }
+            }
+        }
+    }
+]
+
+SYSTEM_PROMPT = f"""You are a helpful coding assistant with access to a project directory at {WORKDIR}.
+You can execute bash commands, read/write/edit files, and list directory contents.
+When the user asks you to write code or make changes, use the tools to actually create and modify files.
+Always show what you're doing and explain your changes. Be concise."""
+
+
+def resolve_path(path):
+    """Resolve a path relative to WORKDIR, preventing directory traversal."""
+    if not path:
+        return WORKDIR
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(WORKDIR) / p
+    p = p.resolve()
+    # Allow WORKDIR and common system paths for reading
+    return str(p)
+
+
+def exec_tool(name, args):
+    """Execute a tool and return the result string."""
+    try:
+        if name == "bash":
+            cmd = args.get("command", "")
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=30, cwd=WORKDIR
+            )
+            output = result.stdout
+            if result.stderr:
+                output += "\n[stderr] " + result.stderr
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
+            return output[:4000] or "(no output)"
+
+        elif name == "read_file":
+            fpath = resolve_path(args.get("path", ""))
+            with open(fpath, "r") as f:
+                content = f.read(50000)
+            return content or "(empty file)"
+
+        elif name == "write_file":
+            fpath = resolve_path(args.get("path", ""))
+            Path(fpath).parent.mkdir(parents=True, exist_ok=True)
+            with open(fpath, "w") as f:
+                f.write(args.get("content", ""))
+            return f"Wrote {len(args.get('content', ''))} bytes to {fpath}"
+
+        elif name == "edit_file":
+            fpath = resolve_path(args.get("path", ""))
+            with open(fpath, "r") as f:
+                content = f.read()
+            old = args.get("old_string", "")
+            new = args.get("new_string", "")
+            if old not in content:
+                return f"Error: old_string not found in {fpath}"
+            content = content.replace(old, new, 1)
+            with open(fpath, "w") as f:
+                f.write(content)
+            return f"Edited {fpath}: replaced {len(old)} chars with {len(new)} chars"
+
+        elif name == "list_files":
+            dpath = resolve_path(args.get("path", ""))
+            depth = min(args.get("depth", 3), 5)
+            lines = []
+            for root, dirs, files in os.walk(dpath):
+                level = root.replace(dpath, "").count(os.sep)
+                if level >= depth:
+                    dirs.clear()
+                    continue
+                # Skip hidden dirs and common noise
+                dirs[:] = [d for d in sorted(dirs) if not d.startswith(".") and d not in
+                          ("node_modules", "__pycache__", ".git", "venv", ".venv")]
+                indent = "  " * level
+                lines.append(f"{indent}{os.path.basename(root)}/")
+                for f in sorted(files)[:50]:
+                    if not f.startswith("."):
+                        lines.append(f"{indent}  {f}")
+            return "\n".join(lines[:200]) or "(empty directory)"
+
+        return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def get_file_tree(path=WORKDIR, depth=3):
+    """Get JSON file tree for the sidebar."""
+    def walk(p, d):
+        if d <= 0:
+            return []
+        items = []
+        try:
+            entries = sorted(Path(p).iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except PermissionError:
+            return []
+        for entry in entries:
+            if entry.name.startswith(".") or entry.name in ("node_modules", "__pycache__", "venv", ".venv"):
+                continue
+            if entry.is_dir():
+                children = walk(str(entry), d - 1) if d > 1 else []
+                items.append({"name": entry.name, "type": "dir", "children": children})
+            else:
+                items.append({"name": entry.name, "type": "file", "path": str(entry)})
+            if len(items) > 100:
+                break
+        return items
+    return walk(path, depth)
+
+
+def chat_with_tools(messages_history, image_data=None):
+    """Send messages to llama-server with tools, handle tool call loop."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    for m in messages_history:
+        if m["role"] == "user":
+            if m.get("image"):
+                messages.append({"role": "user", "content": [
+                    {"type": "text", "text": m["content"]},
+                    {"type": "image_url", "image_url": {"url": m["image"]}}
+                ]})
+            else:
+                messages.append({"role": "user", "content": m["content"]})
+        elif m["role"] == "assistant":
+            messages.append({"role": "assistant", "content": m["content"]})
+
+    tool_calls_log = []
+    max_iterations = 10
+
+    for iteration in range(max_iterations):
+        payload = {
+            "model": "gemma",
+            "messages": messages,
+            "max_tokens": 4096,
+            "temperature": 0.3,
+            "tools": TOOLS,
+        }
+
+        t0 = time.time()
+        try:
+            req = Request(
+                f"{LLAMA_API}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            resp = urlopen(req, timeout=120)
+            result = json.loads(resp.read())
+        except Exception as e:
+            return {"content": f"Error calling model: {e}", "tool_calls": tool_calls_log,
+                    "usage": {}, "time": time.time() - t0}
+
+        elapsed = time.time() - t0
+        choice = result.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        usage = result.get("usage", {})
+
+        # Check for tool calls
+        tc = message.get("tool_calls", [])
+        if not tc:
+            # No tool calls — final response
+            content = message.get("content", "")
+            reasoning = message.get("reasoning_content", "")
+            return {
+                "content": content,
+                "reasoning": reasoning,
+                "tool_calls": tool_calls_log,
+                "usage": usage,
+                "time": elapsed
+            }
+
+        # Execute tool calls
+        messages.append(message)  # Add assistant's tool call message
+
+        for call in tc:
+            fn = call.get("function", {})
+            tool_name = fn.get("name", "")
+            try:
+                tool_args = json.loads(fn.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                tool_args = {}
+
+            tool_result = exec_tool(tool_name, tool_args)
+            tool_calls_log.append({
+                "tool": tool_name,
+                "args": tool_args,
+                "result": tool_result[:2000]
+            })
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.get("id", ""),
+                "content": tool_result
+            })
+
+    return {"content": "(max tool iterations reached)", "tool_calls": tool_calls_log,
+            "usage": {}, "time": 0}
 
 
 def check_auth(cookie_header):
@@ -53,384 +319,413 @@ def check_auth(cookie_header):
     return False
 
 
-def create_session():
-    sid = secrets.token_hex(32)
-    valid_sessions.add(sid)
-    return sid
-
-
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Gemma 4 A4B Chat</title>
+<title>Gemma 4 A4B IDE</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 :root { --bg: #0a0a0f; --surface: #13131a; --surface2: #1a1a24; --border: #2a2a3a;
-        --text: #e0e0e8; --dim: #888898; --accent: #6c8aff; --accent2: #4ecdc4;
-        --green: #4ecdc4; --yellow: #ffd93d; --red: #ff6b6b; }
-body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: var(--bg);
-       color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+        --text: #e0e0e8; --dim: #888898; --accent: #6c8aff; --green: #4ecdc4;
+        --yellow: #ffd93d; --red: #ff6b6b; --orange: #ff9f43; }
+body { font-family: 'SF Mono','Fira Code','Consolas',monospace; background: var(--bg);
+       color: var(--text); height: 100vh; display: flex; flex-direction: column; font-size: 13px; }
 
-/* Header */
 .header { background: var(--surface); border-bottom: 1px solid var(--border);
-          padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; }
-.header h1 { font-size: 14px; font-weight: 600; color: var(--accent); }
-.header .model-info { font-size: 11px; color: var(--dim); }
+          padding: 8px 16px; display: flex; justify-content: space-between; align-items: center; }
+.header h1 { font-size: 13px; color: var(--accent); }
+.header .info { font-size: 11px; color: var(--dim); }
 
-/* Metrics bar */
 .metrics { background: var(--surface2); border-bottom: 1px solid var(--border);
-           padding: 8px 20px; display: flex; gap: 24px; font-size: 11px; overflow-x: auto; }
-.metric { display: flex; flex-direction: column; gap: 2px; min-width: 100px; }
-.metric-label { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-.metric-value { color: var(--green); font-weight: 600; font-size: 13px; }
+           padding: 6px 16px; display: flex; gap: 20px; font-size: 11px; flex-wrap: wrap; }
+.metric { display: flex; gap: 4px; align-items: center; }
+.metric-label { color: var(--dim); }
+.metric-value { color: var(--green); font-weight: 600; }
 .metric-value.yellow { color: var(--yellow); }
-.metric-value.red { color: var(--red); }
 
-/* Chat area */
-.chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-.msg { max-width: 85%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 13px;
-       white-space: pre-wrap; word-break: break-word; }
-.msg.user { background: var(--accent); color: #fff; align-self: flex-end; border-radius: 12px 12px 4px 12px; }
+.main { flex: 1; display: flex; overflow: hidden; }
+
+/* File tree */
+.sidebar { width: 220px; background: var(--surface); border-right: 1px solid var(--border);
+           overflow-y: auto; padding: 8px 0; font-size: 12px; flex-shrink: 0; }
+.sidebar-header { padding: 4px 12px 8px; color: var(--dim); font-size: 10px;
+                  text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--border);
+                  margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center; }
+.sidebar-header button { background: none; border: none; color: var(--dim); cursor: pointer;
+                         font-size: 11px; }
+.tree-item { padding: 2px 12px; cursor: pointer; white-space: nowrap; overflow: hidden;
+             text-overflow: ellipsis; }
+.tree-item:hover { background: var(--surface2); }
+.tree-item.dir { color: var(--accent); }
+.tree-item.file { color: var(--text); }
+
+/* Chat */
+.chat-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 90%; padding: 10px 14px; border-radius: 10px; line-height: 1.5; word-break: break-word; }
+.msg.user { background: var(--accent); color: #fff; align-self: flex-end; border-radius: 10px 10px 2px 10px; }
 .msg.assistant { background: var(--surface2); border: 1px solid var(--border); align-self: flex-start;
-                 border-radius: 12px 12px 12px 4px; }
-.msg.assistant .thinking { color: var(--dim); font-style: italic; font-size: 12px;
-                           border-left: 2px solid var(--border); padding-left: 10px; margin-bottom: 8px; }
-.msg.system { background: transparent; color: var(--dim); font-size: 11px; text-align: center;
-              align-self: center; }
-.msg code, .msg pre { background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
-.msg pre { padding: 10px; margin: 8px 0; overflow-x: auto; display: block; }
-
-/* Streaming indicator */
-.streaming::after { content: '|'; animation: blink 0.8s infinite; color: var(--accent); }
-@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+                 border-radius: 10px 10px 10px 2px; }
+.msg .thinking { color: var(--dim); font-size: 11px; font-style: italic; border-left: 2px solid var(--border);
+                 padding-left: 8px; margin-bottom: 6px; max-height: 100px; overflow-y: auto; }
+.msg .tool-call { background: rgba(0,0,0,0.3); border-radius: 6px; padding: 8px; margin: 6px 0;
+                  font-size: 11px; border-left: 3px solid var(--orange); }
+.msg .tool-call .tool-name { color: var(--orange); font-weight: 600; }
+.msg .tool-call .tool-args { color: var(--dim); margin: 2px 0; }
+.msg .tool-call .tool-result { color: var(--green); white-space: pre-wrap; max-height: 150px;
+                                overflow-y: auto; margin-top: 4px; }
+.msg pre { background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px; overflow-x: auto;
+           margin: 6px 0; font-size: 12px; }
+.msg code { background: rgba(0,0,0,0.3); padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+.msg.system { color: var(--dim); font-size: 11px; text-align: center; align-self: center; background: none; }
+.loading { color: var(--dim); align-self: flex-start; padding: 10px; }
+.loading::after { content: '...'; animation: dots 1.5s infinite; }
+@keyframes dots { 0% { content: '.'; } 33% { content: '..'; } 66% { content: '...'; } }
 
 /* Input */
-.input-area { background: var(--surface); border-top: 1px solid var(--border); padding: 16px 20px; }
-.input-row { display: flex; gap: 10px; }
+.input-area { background: var(--surface); border-top: 1px solid var(--border); padding: 12px 16px; }
+.input-row { display: flex; gap: 8px; align-items: flex-end; }
 textarea { flex: 1; background: var(--surface2); border: 1px solid var(--border); color: var(--text);
-           border-radius: 8px; padding: 10px 14px; font-family: inherit; font-size: 13px; resize: none;
-           outline: none; min-height: 44px; max-height: 200px; }
+           border-radius: 6px; padding: 8px 12px; font-family: inherit; font-size: 13px; resize: none;
+           outline: none; min-height: 40px; max-height: 150px; }
 textarea:focus { border-color: var(--accent); }
-button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 20px;
-         font-family: inherit; font-size: 13px; cursor: pointer; font-weight: 600; }
+button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 8px 16px;
+         font-family: inherit; font-size: 12px; cursor: pointer; font-weight: 600; white-space: nowrap; }
 button:hover { opacity: 0.9; }
-button:disabled { opacity: 0.4; cursor: not-allowed; }
-.clear-btn { background: var(--surface2); color: var(--dim); border: 1px solid var(--border); }
+button:disabled { opacity: 0.3; cursor: not-allowed; }
+.btn-secondary { background: var(--surface2); color: var(--dim); border: 1px solid var(--border); }
+.btn-img { padding: 8px 10px; font-size: 14px; }
+input[type=file] { display: none; }
 
-/* Login */
-.login { display: flex; justify-content: center; align-items: center; height: 100vh;
-         background: var(--bg); }
-.login-box { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-             padding: 32px; width: 360px; }
-.login-box h2 { color: var(--accent); margin-bottom: 20px; font-size: 16px; }
-.login-box input { width: 100%; background: var(--surface2); border: 1px solid var(--border);
-                   color: var(--text); border-radius: 8px; padding: 10px 14px; font-family: inherit;
-                   font-size: 13px; outline: none; margin-bottom: 16px; }
-.login-box input:focus { border-color: var(--accent); }
-.login-box button { width: 100%; }
-.login-error { color: var(--red); font-size: 12px; margin-bottom: 10px; }
+@media (max-width: 768px) { .sidebar { display: none; } }
 </style>
 </head>
 <body>
-<div id="app"></div>
-<script>
-const API = '';
-let messages = [];
-let streaming = false;
-let metrics = { prompt_tps: '-', gen_tps: '-', reasoning_tok: '-', completion_tok: '-',
-                total_tok: '-', ttft: '-', total_time: '-', cached: '-' };
-
-function render() {
-  const app = document.getElementById('app');
-  app.innerHTML = `
-    <div class="header">
-      <h1>Gemma 4 26B-A4B</h1>
-      <div class="model-info">MoE 128 experts | TurboQuant | Vision</div>
-    </div>
-    <div class="metrics">
-      <div class="metric"><span class="metric-label">Prompt Eval</span><span class="metric-value">${metrics.prompt_tps} t/s</span></div>
-      <div class="metric"><span class="metric-label">Generation</span><span class="metric-value">${metrics.gen_tps} t/s</span></div>
-      <div class="metric"><span class="metric-label">TTFT</span><span class="metric-value">${metrics.ttft}</span></div>
-      <div class="metric"><span class="metric-label">Reasoning</span><span class="metric-value yellow">${metrics.reasoning_tok} tok</span></div>
-      <div class="metric"><span class="metric-label">Completion</span><span class="metric-value">${metrics.completion_tok} tok</span></div>
-      <div class="metric"><span class="metric-label">Total</span><span class="metric-value">${metrics.total_tok} tok</span></div>
-      <div class="metric"><span class="metric-label">Total Time</span><span class="metric-value">${metrics.total_time}</span></div>
-      <div class="metric"><span class="metric-label">Cache</span><span class="metric-value">${metrics.cached} tok</span></div>
-    </div>
-    <div class="chat" id="chat">
-      ${messages.length === 0 ? '<div class="msg system">Send a message to start chatting. Supports text and image input.</div>' : ''}
-      ${messages.map((m,i) => {
-        if (m.role === 'user') return `<div class="msg user">${esc(m.content)}</div>`;
-        let html = `<div class="msg assistant${streaming && i===messages.length-1 ? ' streaming' : ''}">`;
-        if (m.reasoning) html += `<div class="thinking">${esc(m.reasoning)}</div>`;
-        html += formatContent(m.content || '') + '</div>';
-        return html;
-      }).join('')}
-    </div>
+<div class="header">
+  <h1>Gemma 4 26B-A4B</h1>
+  <div class="info">MoE 128 experts, 8 active | Q4_K_M | Vision | Tools</div>
+</div>
+<div class="metrics" id="metrics">
+  <div class="metric"><span class="metric-label">Gen:</span><span class="metric-value" id="m-gen">-</span></div>
+  <div class="metric"><span class="metric-label">TTFT:</span><span class="metric-value" id="m-ttft">-</span></div>
+  <div class="metric"><span class="metric-label">Reasoning:</span><span class="metric-value yellow" id="m-reason">-</span></div>
+  <div class="metric"><span class="metric-label">Completion:</span><span class="metric-value" id="m-comp">-</span></div>
+  <div class="metric"><span class="metric-label">Tools:</span><span class="metric-value" id="m-tools">0</span></div>
+  <div class="metric"><span class="metric-label">Total:</span><span class="metric-value" id="m-total">-</span></div>
+  <div class="metric"><span class="metric-label">Time:</span><span class="metric-value" id="m-time">-</span></div>
+</div>
+<div class="main">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="chat-area">
+    <div class="chat" id="chat"></div>
     <div class="input-area">
       <div class="input-row">
-        <textarea id="input" placeholder="Type a message... (Shift+Enter for newline)" rows="1"
+        <button class="btn-img" onclick="document.getElementById('img-input').click()" title="Attach image">&#128247;</button>
+        <input type="file" id="img-input" accept="image/*" onchange="handleImage(this)">
+        <textarea id="input" placeholder="Ask me to write code, run commands, edit files..." rows="1"
           onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"
-          ${streaming ? 'disabled' : ''}></textarea>
-        <button onclick="send()" ${streaming ? 'disabled' : ''}>Send</button>
-        <button class="clear-btn" onclick="clearChat()">Clear</button>
+          oninput="this.style.height='40px';this.style.height=Math.min(this.scrollHeight,150)+'px'"></textarea>
+        <button onclick="send()" id="send-btn">Send</button>
+        <button class="btn-secondary" onclick="clearChat()">Clear</button>
       </div>
-    </div>`;
-  const chat = document.getElementById('chat');
-  chat.scrollTop = chat.scrollHeight;
-  if (!streaming) document.getElementById('input')?.focus();
+      <div id="img-preview" style="display:none;margin-top:6px;font-size:11px;color:var(--dim)"></div>
+    </div>
+  </div>
+</div>
+<script>
+let messages = [];
+let busy = false;
+let pendingImage = null;
+let fileTree = [];
+
+function loadTree() {
+  fetch('/api/tree').then(r=>r.json()).then(data => { fileTree = data; renderTree(); });
 }
 
-function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function renderTree() {
+  const el = document.getElementById('sidebar');
+  function renderItems(items, depth) {
+    return items.map(item => {
+      const indent = depth * 12;
+      if (item.type === 'dir') {
+        return `<div class="tree-item dir" style="padding-left:${12+indent}px"
+          onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+          &#128193; ${item.name}</div><div style="display:${depth<1?'block':'none'}">${renderItems(item.children||[],depth+1)}</div>`;
+      }
+      return `<div class="tree-item file" style="padding-left:${12+indent}px"
+        onclick="readFile('${(item.path||'').replace(/'/g,"\\'")}')">&#128196; ${item.name}</div>`;
+    }).join('');
+  }
+  el.innerHTML = `<div class="sidebar-header">Files <button onclick="loadTree()">&#8635;</button></div>` +
+    renderItems(fileTree, 0);
+}
 
-function formatContent(s) {
-  // Basic markdown: code blocks, inline code, bold
-  return esc(s)
-    .replace(/```(\\w*)\\n([\\s\\S]*?)```/g, '<pre><code>$2</code></pre>')
+function readFile(path) {
+  if (!path || busy) return;
+  const input = document.getElementById('input');
+  input.value = `Read the file: ${path}`;
+  send();
+}
+
+function handleImage(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    pendingImage = reader.result;
+    document.getElementById('img-preview').style.display = 'block';
+    document.getElementById('img-preview').innerHTML =
+      `&#128247; ${file.name} (${(file.size/1024).toFixed(0)}KB) <button class="btn-secondary"
+       style="padding:2px 6px;font-size:10px" onclick="pendingImage=null;this.parentElement.style.display='none'">x</button>`;
+  };
+  reader.readAsDataURL(file);
+  input.value = '';
+}
+
+function formatMsg(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\n/g, '<br>');
+}
+
+function renderChat() {
+  const chat = document.getElementById('chat');
+  let html = '';
+  if (messages.length === 0) {
+    html = `<div class="msg system">Chat with Gemma 4 A4B. Attach images, ask it to write code, run commands, or edit files.</div>`;
+  }
+  for (const m of messages) {
+    if (m.role === 'user') {
+      html += `<div class="msg user">${formatMsg(m.content)}${m.image ? '<br><span style="font-size:11px">&#128247; image attached</span>' : ''}</div>`;
+    } else if (m.role === 'assistant') {
+      html += `<div class="msg assistant">`;
+      if (m.reasoning) html += `<div class="thinking">${formatMsg(m.reasoning)}</div>`;
+      if (m.tool_calls?.length) {
+        for (const tc of m.tool_calls) {
+          html += `<div class="tool-call"><span class="tool-name">${tc.tool}</span>`;
+          const argStr = tc.tool === 'bash' ? tc.args.command :
+                        tc.tool === 'write_file' ? `${tc.args.path} (${tc.args.content?.length||0} bytes)` :
+                        tc.tool === 'read_file' ? tc.args.path :
+                        tc.tool === 'edit_file' ? tc.args.path :
+                        JSON.stringify(tc.args);
+          html += `<div class="tool-args">${formatMsg(argStr)}</div>`;
+          if (tc.result) html += `<div class="tool-result">${formatMsg(tc.result.slice(0,500))}</div>`;
+          html += `</div>`;
+        }
+      }
+      html += formatMsg(m.content) + `</div>`;
+    } else if (m.role === 'loading') {
+      html += `<div class="loading">Thinking</div>`;
+    }
+  }
+  chat.innerHTML = html;
+  chat.scrollTop = chat.scrollHeight;
 }
 
 async function send() {
   const input = document.getElementById('input');
   const text = input.value.trim();
-  if (!text || streaming) return;
+  if (!text || busy) return;
 
-  messages.push({ role: 'user', content: text });
-  messages.push({ role: 'assistant', content: '', reasoning: '' });
-  streaming = true;
-  metrics = { prompt_tps: '...', gen_tps: '...', reasoning_tok: '0', completion_tok: '0',
-              total_tok: '0', ttft: '...', total_time: '...', cached: '...' };
-  render();
+  const userMsg = { role: 'user', content: text };
+  if (pendingImage) {
+    userMsg.image = pendingImage;
+    pendingImage = null;
+    document.getElementById('img-preview').style.display = 'none';
+  }
+  messages.push(userMsg);
+  messages.push({ role: 'loading' });
+  input.value = '';
+  input.style.height = '40px';
+  busy = true;
+  document.getElementById('send-btn').disabled = true;
+  renderChat();
 
   const t0 = performance.now();
-  let ttft = null;
-
   try {
-    const apiMessages = messages.filter(m => m.role === 'user').length > 0 ?
-      messages.slice(0, -1).map(m => ({ role: m.role, content: m.content })) : [];
-
-    const resp = await fetch(API + '/v1/chat/completions', {
+    const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'gemma',
-        messages: apiMessages,
-        max_tokens: 4096,
-        temperature: 0.7,
-        stream: true
-      })
+      body: JSON.stringify({ messages: messages.filter(m => m.role !== 'loading') })
+    });
+    const data = await resp.json();
+    const elapsed = (performance.now() - t0) / 1000;
+
+    // Remove loading
+    messages = messages.filter(m => m.role !== 'loading');
+
+    messages.push({
+      role: 'assistant',
+      content: data.content || '',
+      reasoning: data.reasoning || '',
+      tool_calls: data.tool_calls || []
     });
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    const last = messages[messages.length - 1];
-    let inReasoning = false;
+    // Update metrics
+    const u = data.usage || {};
+    const totalTok = u.completion_tokens || 0;
+    const promptTok = u.prompt_tokens || 0;
+    const tc = data.tool_calls || [];
+    const reasonLen = (data.reasoning || '').split(/\s+/).filter(w=>w).length;
+    const contentLen = (data.content || '').split(/\s+/).filter(w=>w).length;
+    const totalWords = reasonLen + contentLen;
+    const reasonTok = totalWords > 0 ? Math.round(totalTok * reasonLen / totalWords) : 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
+    document.getElementById('m-gen').textContent = elapsed > 0 ? (totalTok / elapsed).toFixed(1) + ' t/s' : '-';
+    document.getElementById('m-ttft').textContent = data.time ? data.time.toFixed(1) + 's' : '-';
+    document.getElementById('m-reason').textContent = reasonTok;
+    document.getElementById('m-comp').textContent = totalTok - reasonTok;
+    document.getElementById('m-tools').textContent = tc.length;
+    document.getElementById('m-total').textContent = totalTok + ' tok';
+    document.getElementById('m-time').textContent = elapsed.toFixed(1) + 's';
 
-      const lines = buf.split('\\n');
-      buf = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') continue;
-
-        try {
-          const chunk = JSON.parse(data);
-          const delta = chunk.choices?.[0]?.delta;
-          if (!delta) continue;
-
-          if (ttft === null && (delta.content || delta.reasoning_content)) {
-            ttft = performance.now() - t0;
-            metrics.ttft = (ttft / 1000).toFixed(2) + 's';
-          }
-
-          if (delta.reasoning_content) {
-            last.reasoning = (last.reasoning || '') + delta.reasoning_content;
-            metrics.reasoning_tok = (last.reasoning.split(/\\s+/).length || 0).toString();
-          }
-          if (delta.content) {
-            last.content = (last.content || '') + delta.content;
-            metrics.completion_tok = (last.content.split(/\\s+/).length || 0).toString();
-          }
-
-          const usage = chunk.usage;
-          if (usage) {
-            metrics.total_tok = (usage.completion_tokens || 0).toString();
-            metrics.cached = (usage.prompt_tokens_details?.cached_tokens || 0).toString();
-            const promptTok = usage.prompt_tokens || 0;
-            const completionTok = usage.completion_tokens || 0;
-            const elapsed = (performance.now() - t0) / 1000;
-            if (ttft && completionTok > 0) {
-              const genTime = elapsed - (ttft / 1000);
-              metrics.gen_tps = genTime > 0 ? (completionTok / genTime).toFixed(1) : '-';
-            }
-            if (ttft && promptTok > 0) {
-              metrics.prompt_tps = (promptTok / (ttft / 1000)).toFixed(1);
-            }
-          }
-
-          metrics.total_time = ((performance.now() - t0) / 1000).toFixed(1) + 's';
-          render();
-        } catch (e) {}
-      }
-    }
-
-    // Final usage from non-streaming fallback
-    const elapsed = (performance.now() - t0) / 1000;
-    metrics.total_time = elapsed.toFixed(1) + 's';
+    // Refresh file tree after tool calls
+    if (tc.length > 0) loadTree();
 
   } catch (e) {
-    const last = messages[messages.length - 1];
-    last.content = 'Error: ' + e.message;
+    messages = messages.filter(m => m.role !== 'loading');
+    messages.push({ role: 'assistant', content: 'Error: ' + e.message });
   }
 
-  streaming = false;
-  render();
+  busy = false;
+  document.getElementById('send-btn').disabled = false;
+  renderChat();
+  document.getElementById('input').focus();
 }
 
-function clearChat() { messages = []; metrics = { prompt_tps: '-', gen_tps: '-', reasoning_tok: '-',
-  completion_tok: '-', total_tok: '-', ttft: '-', total_time: '-', cached: '-' }; render(); }
+function clearChat() {
+  messages = [];
+  ['m-gen','m-ttft','m-reason','m-comp','m-tools','m-total','m-time'].forEach(id =>
+    document.getElementById(id).textContent = '-');
+  renderChat();
+}
 
-render();
+// Init
+loadTree();
+renderChat();
+document.getElementById('input').focus();
 </script>
 </body>
 </html>"""
 
 LOGIN_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Login — Gemma 4 Chat</title>
+<title>Login — Gemma 4</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-:root { --bg: #0a0a0f; --surface: #13131a; --surface2: #1a1a24; --border: #2a2a3a;
-        --text: #e0e0e8; --accent: #6c8aff; --red: #ff6b6b; }
-body { font-family: 'SF Mono', monospace; background: var(--bg); color: var(--text);
+body { font-family: 'SF Mono',monospace; background: #0a0a0f; color: #e0e0e8;
        display: flex; justify-content: center; align-items: center; height: 100vh; }
-.login-box { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-             padding: 32px; width: 360px; }
-h2 { color: var(--accent); margin-bottom: 20px; font-size: 16px; }
-input { width: 100%; background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+.box { background: #13131a; border: 1px solid #2a2a3a; border-radius: 12px; padding: 32px; width: 360px; }
+h2 { color: #6c8aff; margin-bottom: 20px; font-size: 16px; }
+input { width: 100%; background: #1a1a24; border: 1px solid #2a2a3a; color: #e0e0e8;
         border-radius: 8px; padding: 10px 14px; font-family: inherit; font-size: 13px;
         outline: none; margin-bottom: 16px; }
-input:focus { border-color: var(--accent); }
-button { width: 100%; background: var(--accent); color: #fff; border: none; border-radius: 8px;
+input:focus { border-color: #6c8aff; }
+button { width: 100%; background: #6c8aff; color: #fff; border: none; border-radius: 8px;
          padding: 10px; font-family: inherit; font-size: 13px; cursor: pointer; font-weight: 600; }
-.error { color: var(--red); font-size: 12px; margin-bottom: 10px; display: ERROR_DISPLAY; }
+.err { color: #ff6b6b; font-size: 12px; margin-bottom: 10px; display: ERR_DISPLAY; }
 </style></head>
-<body><div class="login-box"><h2>Gemma 4 A4B Chat</h2>
-<div class="error">ERROR_MSG</div>
+<body><div class="box"><h2>Gemma 4 A4B IDE</h2>
+<div class="err">ERR_MSG</div>
 <form method="POST" action="/login">
 <input type="password" name="token" placeholder="Enter access token" autofocus>
-<button type="submit">Login</button>
-</form></div></body></html>"""
+<button type="submit">Login</button></form></div></body></html>"""
 
 
-class ChatHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass  # Suppress default logging
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
 
     def do_GET(self):
         path = urlparse(self.path).path
-
         if path == "/login":
-            self._send_login()
-            return
-
+            return self._login_page()
         if not check_auth(self.headers.get("Cookie", "")):
-            self.send_response(302)
-            self.send_header("Location", "/login")
-            self.end_headers()
-            return
-
-        if path == "/" or path == "":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(HTML_PAGE.encode())
-            return
-
-        self.send_response(404)
-        self.end_headers()
+            return self._redirect("/login")
+        if path in ("/", ""):
+            self._html(HTML_PAGE)
+        elif path == "/api/tree":
+            self._json(get_file_tree())
+        else:
+            self.send_response(404); self.end_headers()
 
     def do_POST(self):
         path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
 
         if path == "/login":
             params = parse_qs(body.decode())
             token = params.get("token", [""])[0]
             if secrets.compare_digest(token, AUTH_TOKEN):
-                sid = create_session()
+                sid = secrets.token_hex(32)
+                valid_sessions.add(sid)
                 self.send_response(302)
                 self.send_header("Set-Cookie", f"session={sid}; HttpOnly; Path=/; SameSite=Strict; Max-Age=86400")
                 self.send_header("Location", "/")
                 self.end_headers()
             else:
-                self._send_login(error="Invalid token")
+                self._login_page("Invalid token")
             return
 
         if not check_auth(self.headers.get("Cookie", "")):
-            self.send_response(401)
-            self.end_headers()
-            return
+            self.send_response(401); self.end_headers(); return
 
-        # Proxy API requests to llama-server
-        if path.startswith("/v1/"):
-            self._proxy_api(path, body)
-            return
+        if path == "/api/chat":
+            data = json.loads(body)
+            result = chat_with_tools(data.get("messages", []))
+            self._json(result)
+        else:
+            self.send_response(404); self.end_headers()
 
-        self.send_response(404)
-        self.end_headers()
-
-    def _send_login(self, error=None):
-        page = LOGIN_PAGE.replace("ERROR_MSG", error or "").replace(
-            "ERROR_DISPLAY", "block" if error else "none")
+    def _html(self, content):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(page.encode())
+        self.wfile.write(content.encode())
 
-    def _proxy_api(self, path, body):
-        """Proxy request to llama-server, streaming the response back."""
-        url = f"{LLAMA_API}{path}"
+    def _json(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _redirect(self, loc):
+        self.send_response(302)
+        self.send_header("Location", loc)
+        self.end_headers()
+
+    def _login_page(self, error=None):
+        page = LOGIN_PAGE.replace("ERR_MSG", error or "").replace("ERR_DISPLAY", "block" if error else "none")
+        self._html(page)
+
+
+class ThreadedHTTPServer(HTTPServer):
+    """Handle requests in threads for concurrent access."""
+    def process_request(self, request, client_address):
+        t = threading.Thread(target=self.process_request_thread, args=(request, client_address))
+        t.daemon = True
+        t.start()
+
+    def process_request_thread(self, request, client_address):
         try:
-            req = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-            resp = urlopen(req, timeout=300)
-
-            self.send_response(resp.status)
-            for key, val in resp.getheaders():
-                if key.lower() in ("content-type", "transfer-encoding"):
-                    self.send_header(key, val)
-            self.end_headers()
-
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except URLError as e:
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"Backend unavailable: {e}"}).encode())
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
 
 
 def main():
-    server = HTTPServer(("0.0.0.0", PORT), ChatHandler)
-    print(f"Chat server running on http://0.0.0.0:{PORT}")
+    server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Gemma 4 IDE running on http://0.0.0.0:{PORT}")
     print(f"Backend: {LLAMA_API}")
-    print(f"Auth token: {AUTH_TOKEN[:8]}...{AUTH_TOKEN[-4:]}")
-    print(f"\nOpen in browser and enter the auth token to start chatting.\n")
+    print(f"Workdir: {WORKDIR}")
+    print(f"Token: {AUTH_TOKEN[:8]}...{AUTH_TOKEN[-4:]}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

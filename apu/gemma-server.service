@@ -1,0 +1,20 @@
+[Unit]
+Description=Gemma 4 31B LLM Server (TurboQuant)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Set your username and paths here:
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/llama.cpp
+ExecStart=/bin/bash /home/YOUR_USER/gemma_server.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+Nice=-10
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

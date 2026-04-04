@@ -269,6 +269,10 @@ def chat_with_tools_streaming(messages_history, write_sse):
         t0 = time.time()
 
         try:
+            # Log message structure for debugging
+            msg_summary = [(m.get("role"), "image" if isinstance(m.get("content"), list) else str(m.get("content",""))[:50]) for m in messages]
+            print(f"[INFO] Iter {iteration}, messages: {msg_summary}", flush=True)
+
             # Always use non-streaming first (simpler, more reliable)
             resp = call_model(messages, stream=False)
             result = json.loads(resp.read())

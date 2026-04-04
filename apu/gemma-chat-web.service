@@ -1,0 +1,18 @@
+[Unit]
+Description=Gemma 4 A4B Web Chat Interface
+After=gemma-server.service
+Wants=gemma-server.service
+
+[Service]
+Type=simple
+# Set your username and auth token:
+User=YOUR_USER
+Environment=AUTH_TOKEN=YOUR_SECURE_TOKEN
+Environment=LLAMA_API=http://localhost:8082
+Environment=CHAT_PORT=8080
+ExecStart=/usr/bin/python3 /home/YOUR_USER/chat_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

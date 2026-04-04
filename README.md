@@ -612,20 +612,48 @@ The A4B MoE model breaks through the bandwidth wall that limits dense models —
 
 ---
 
+### Web Chat Interface
+
+`chat_server.py` provides an authenticated web UI with real-time metrics:
+
+```bash
+# Generate a secure token and start
+export AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
+python3 apu/chat_server.py
+
+# Open http://your-server:8080 and enter the token
+```
+
+Features:
+- Token-based authentication (session cookies, HttpOnly)
+- Real-time metrics: prompt eval t/s, generation t/s, TTFT, reasoning/completion token breakdown, cache hits
+- Streaming responses with thinking/reasoning display
+- Proxies to the llama-server API (must be running on port 8082)
+
+Install as systemd service:
+```bash
+# Edit the service file with your username and token
+sed -e "s/YOUR_USER/$(whoami)/g" -e "s/YOUR_SECURE_TOKEN/$AUTH_TOKEN/g" \
+  apu/gemma-chat-web.service | sudo tee /etc/systemd/system/gemma-chat-web.service
+sudo systemctl daemon-reload && sudo systemctl enable --now gemma-chat-web
+```
+
 ## File Structure
 
 ```
 gemma4-engine/
-  engine.py            # E4B custom inference engine (457 lines)
-  engine_turbo.py      # E4B + TurboQuant KV compression (781 lines)
-  server.py            # E4B Anthropic API translation server (504 lines)
-  benchmark.py         # E4B benchmark suite
-  requirements.txt     # Python dependencies (E4B)
+  engine.py              # E4B custom inference engine (457 lines)
+  engine_turbo.py        # E4B + TurboQuant KV compression (781 lines)
+  server.py              # E4B Anthropic API translation server (504 lines)
+  benchmark.py           # E4B benchmark suite
+  requirements.txt       # Python dependencies (E4B)
   apu/
-    create_turbo_quant.sh   # Build mixed-precision GGUF (works for A4B and dense)
-    gemma_server.sh         # API server with vision support
-    gemma_chat.sh           # Interactive chat with lookup decoding (~230 tok/s)
-    gemma-server.service    # systemd unit for auto-start
+    create_turbo_quant.sh    # Build mixed-precision GGUF (works for A4B and dense)
+    gemma_server.sh          # API server with vision support (~65 tok/s)
+    gemma_chat.sh            # Interactive CLI with lookup decoding (~230 tok/s)
+    chat_server.py           # Web chat UI with auth and live metrics
+    gemma-server.service     # systemd: model API server
+    gemma-chat-web.service   # systemd: web chat interface
 ```
 
 ---

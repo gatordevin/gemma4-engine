@@ -1,23 +1,37 @@
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 3e68c38..8ce5135 100644
+index 3e68c38..37e4217 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -687,7 +687,13 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
+@@ -666,6 +666,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
+         , n_draft(n_draft)
+         , save_dynamic(save_dynamic)
+         , save_static(save_static)
++        , path_dynamic_file(path_dynamic)
+     {
+         if (!path_static.empty()) {
+             try {
+@@ -686,8 +687,19 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
+         }
      }
  
++    // Full token sequence for cache context (mirrors standalone llama-lookup)
++    llama_tokens full_seq;
++    llama_tokens last_draft;
++    std::string path_dynamic_file;
++
      void begin(const llama_tokens & prompt) override {
 -        GGML_UNUSED(prompt);
-+        // Pre-seed n-gram cache from the full prompt
-+        if (!prompt.empty()) {
-+            llama_tokens prompt_copy(prompt);
-+            common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
-+                    prompt_copy, prompt_copy.size(), false);
-+            cache_size = prompt.size();
-+        }
++        full_seq.clear();
++        full_seq.reserve(prompt.size() + 8192);
++        full_seq.insert(full_seq.end(), prompt.begin(), prompt.end());
++        llama_tokens prompt_copy(prompt);
++        common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
++                prompt_copy, prompt_copy.size(), false);
++        cache_size = prompt.size();
      }
  
      void draft(
-@@ -697,20 +703,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
+@@ -697,20 +709,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
              llama_tokens & result) override {
          GGML_UNUSED(params);
  
@@ -35,64 +49,68 @@ index 3e68c38..8ce5135 100644
 -            cache_size = prompt_tgt.size() + 1;
 -        }
 -
-+        // Build full token sequence (prompt + all generated so far)
++        // Build full sequence from prompt_tgt + id_last
          llama_tokens inp;
          inp.reserve(prompt_tgt.size() + 1);
          for (size_t j = 0; j < prompt_tgt.size(); ++j) {
-@@ -718,6 +711,9 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
+@@ -718,6 +717,15 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
          }
          inp.push_back(id_last);
  
-+        // Cache update happens in begin() and accept() - not here
-+        // This avoids double-counting after rollback
-+
-         result.push_back(id_last);
- 
-         common_ngram_cache_draft(inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
-@@ -729,11 +725,40 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
-             // delete first token in result (which is the id_last token)
-             result.erase(result.begin());
-         }
-+
-+        // Store full sequence for accept() to use as context
-+        // After rollback, prompt_tgt will have: old tokens + accepted tokens
-+        // last_inp needs to match so accept() builds correct n-grams
-+        last_inp = inp;
-+        last_draft = result;
-+        
-+        // If cache is behind (after rollback), catch up
-+        if (cache_size < inp.size()) {
++        // Update cache with new tokens using full sequence for context
++        if (inp.size() > cache_size) {
 +            size_t nnew = inp.size() - cache_size;
 +            common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
 +                    inp, nnew, false);
 +            cache_size = inp.size();
 +        }
++
++        full_seq = inp;
+         result.push_back(id_last);
+ 
+         common_ngram_cache_draft(inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+@@ -726,14 +734,37 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
+                 ngram_cache_static);
+ 
+         if (result.size() > 0) {
+-            // delete first token in result (which is the id_last token)
+             result.erase(result.begin());
+         }
++        last_draft = result;
      }
  
-+    // Store last inp/draft for accept() to use
-+    llama_tokens last_inp;
-+    llama_tokens last_draft;
++    size_t total_accepted = 0;
 +
      void accept(uint16_t n_accepted) override {
 -        // TODO: noop
 -        GGML_UNUSED(n_accepted);
-+        // Update n-gram cache with accepted tokens, one at a time
-+        // Using the full sequence (last_inp) for proper n-gram context
-+        if (n_accepted > 0 && !last_inp.empty() && !last_draft.empty()) {
++        if (n_accepted > 0 && !full_seq.empty() && !last_draft.empty()) {
 +            for (uint16_t j = 0; j < n_accepted && j < (uint16_t)last_draft.size(); ++j) {
-+                last_inp.push_back(last_draft[j]);
++                full_seq.push_back(last_draft[j]);
 +                common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
-+                        last_inp, 1, false);
++                        full_seq, 1, false);
 +            }
-+            cache_size = last_inp.size();
++            cache_size = full_seq.size();
++            total_accepted += n_accepted;
++
++            // Periodically save cache to disk (every ~2000 accepted tokens)
++            if (false && total_accepted > 100) { LOG_INF("SAVING cache: save_dynamic=%d path=%s total_accepted=%zu\n", (int)save_dynamic, path_dynamic_file.c_str(), total_accepted); } if (!path_dynamic_file.empty() && n_accepted > 0) { // FORCE SAVE
++                common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
++                common_ngram_cache_save(ngram_cache_dynamic, path_dynamic_file);
++            }
 +        }
-+        // Also handle the final sampled token (not in draft, but accepted)
-+        // The server adds ids.back() as slot.sampled, which will appear as id_last
-+        // in the next draft() call. We need to add it here too.
++    }
++
++    ~common_speculative_state_ngram_cache() {
++        // Persist cache to disk on shutdown
++        if (save_dynamic && !path_dynamic_file.empty()) {
++            common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
++            common_ngram_cache_save(ngram_cache_dynamic, path_dynamic_file);
++        }
      }
  };
  
-@@ -754,7 +779,7 @@ static common_ngram_map get_common_ngram_map(const common_speculative_config & c
+@@ -754,11 +785,11 @@ static common_ngram_map get_common_ngram_map(const common_speculative_config & c
  static common_speculative_state_ngram_cache create_state_ngram_cache(
          const std::string & path_static, const std::string & path_dynamic,
          const common_speculative_config & config) {
@@ -101,3 +119,8 @@ index 3e68c38..8ce5135 100644
  
      // TODO bool param in common/common.h to set save_static/save_dynamic?
      bool save_static = false;
+-    bool save_dynamic = false;
++    bool save_dynamic = !path_dynamic.empty();
+ 
+     common_speculative_state_ngram_cache state(config.type, path_static, path_dynamic, n_draft, save_static, save_dynamic);
+ 

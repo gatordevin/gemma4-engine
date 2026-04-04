@@ -232,7 +232,8 @@ def build_api_messages(messages_history):
                 ]})
             else:
                 messages.append({"role": "user", "content": m["content"]})
-        elif m["role"] == "assistant":
+        elif m["role"] == "assistant" and m.get("content"):
+            # Skip empty assistant messages (placeholders from frontend)
             messages.append({"role": "assistant", "content": m["content"]})
     return messages
 
@@ -257,43 +258,40 @@ def call_model(messages, stream=False):
 
 
 def chat_with_tools_streaming(messages_history, write_sse):
-    """Run tool loop, streaming the final text response via SSE."""
+    """Stream response via SSE. Handle tool calls in non-streaming mode, final response streamed."""
     messages = build_api_messages(messages_history)
-    tool_calls_log = []
     total_usage = {}
 
     for iteration in range(10):
         t0 = time.time()
+
+        # First try streaming — if model wants tool calls it won't stream properly,
+        # so we do non-streaming for tool detection
         try:
             resp = call_model(messages, stream=False)
             result = json.loads(resp.read())
         except Exception as e:
-            write_sse({"type": "error", "content": f"Model error: {e}"})
+            err_body = ""
+            if hasattr(e, 'read'):
+                try: err_body = e.read().decode()[:500]
+                except: pass
+            print(f"[ERROR] Model call failed: {e} | body: {err_body}", flush=True)
+            print(f"[ERROR] Messages: {json.dumps(messages)[:500]}", flush=True)
+            write_sse({"type": "error", "content": f"Model error: {e} {err_body}"})
             return
 
-        elapsed = time.time() - t0
         choice = result.get("choices", [{}])[0]
         message = choice.get("message", {})
         total_usage = result.get("usage", total_usage)
         tc = message.get("tool_calls", [])
 
         if not tc:
-            # Final response — now re-request with streaming for live output
-            # Send any accumulated tool calls first
-            if tool_calls_log:
-                write_sse({"type": "tools", "tool_calls": tool_calls_log})
-
-            # Send reasoning if present
-            reasoning = message.get("reasoning_content", "")
-            if reasoning:
-                write_sse({"type": "reasoning", "content": reasoning})
-
-            # Now stream the final text response
+            # No tool calls — stream the response live
             write_sse({"type": "stream_start"})
             try:
                 stream_resp = call_model(messages, stream=True)
-                for line in stream_resp:
-                    line = line.decode("utf-8", errors="ignore").strip()
+                for raw_line in stream_resp:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
                     if not line.startswith("data: "):
                         continue
                     data = line[6:].strip()
@@ -306,21 +304,24 @@ def chat_with_tools_streaming(messages_history, write_sse):
                             write_sse({"type": "token", "content": delta["content"]})
                         if delta.get("reasoning_content"):
                             write_sse({"type": "reasoning_token", "content": delta["reasoning_content"]})
-                        # Check for usage in final chunk
                         if chunk.get("usage"):
                             total_usage = chunk["usage"]
                     except json.JSONDecodeError:
                         pass
-            except Exception as e:
-                # Streaming failed, fall back to the non-streamed content
+            except Exception:
+                # Streaming failed — send the non-streamed content
                 content = message.get("content", "")
+                reasoning = message.get("reasoning_content", "")
+                if reasoning:
+                    write_sse({"type": "reasoning_token", "content": reasoning})
                 if content:
                     write_sse({"type": "token", "content": content})
 
+            elapsed = time.time() - t0
             write_sse({"type": "done", "usage": total_usage, "time": elapsed})
             return
 
-        # Tool calls — execute them and continue the loop
+        # Tool calls — execute and loop
         messages.append(message)
         for call in tc:
             fn = call.get("function", {})
@@ -331,12 +332,6 @@ def chat_with_tools_streaming(messages_history, write_sse):
                 tool_args = {}
 
             tool_result = exec_tool(tool_name, tool_args)
-            tool_calls_log.append({
-                "tool": tool_name,
-                "args": tool_args,
-                "result": tool_result[:2000]
-            })
-            # Send tool call live
             write_sse({"type": "tool_exec", "tool": tool_name, "args": tool_args,
                        "result": tool_result[:2000]})
 
@@ -607,7 +602,7 @@ async function send() {
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: messages.filter(m => m.role !== 'loading') })
+      body: JSON.stringify({ messages: messages.filter(m => m.role === 'user' || (m.role === 'assistant' && m.content)) })
     });
 
     const reader = resp.body.getReader();

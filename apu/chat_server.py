@@ -220,10 +220,9 @@ def get_file_tree(path=WORKDIR, depth=3):
     return walk(path, depth)
 
 
-def chat_with_tools(messages_history, image_data=None):
-    """Send messages to llama-server with tools, handle tool call loop."""
+def build_api_messages(messages_history):
+    """Convert frontend messages to API format."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
     for m in messages_history:
         if m["role"] == "user":
             if m.get("image"):
@@ -235,55 +234,94 @@ def chat_with_tools(messages_history, image_data=None):
                 messages.append({"role": "user", "content": m["content"]})
         elif m["role"] == "assistant":
             messages.append({"role": "assistant", "content": m["content"]})
+    return messages
 
+
+def call_model(messages, stream=False):
+    """Call llama-server. Returns parsed JSON or raw response for streaming."""
+    payload = {
+        "model": "gemma",
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 0.3,
+        "tools": TOOLS,
+        "stream": stream,
+    }
+    req = Request(
+        f"{LLAMA_API}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    return urlopen(req, timeout=180)
+
+
+def chat_with_tools_streaming(messages_history, write_sse):
+    """Run tool loop, streaming the final text response via SSE."""
+    messages = build_api_messages(messages_history)
     tool_calls_log = []
-    max_iterations = 10
+    total_usage = {}
 
-    for iteration in range(max_iterations):
-        payload = {
-            "model": "gemma",
-            "messages": messages,
-            "max_tokens": 4096,
-            "temperature": 0.3,
-            "tools": TOOLS,
-        }
-
+    for iteration in range(10):
         t0 = time.time()
         try:
-            req = Request(
-                f"{LLAMA_API}/v1/chat/completions",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            resp = urlopen(req, timeout=120)
+            resp = call_model(messages, stream=False)
             result = json.loads(resp.read())
         except Exception as e:
-            return {"content": f"Error calling model: {e}", "tool_calls": tool_calls_log,
-                    "usage": {}, "time": time.time() - t0}
+            write_sse({"type": "error", "content": f"Model error: {e}"})
+            return
 
         elapsed = time.time() - t0
         choice = result.get("choices", [{}])[0]
         message = choice.get("message", {})
-        usage = result.get("usage", {})
-
-        # Check for tool calls
+        total_usage = result.get("usage", total_usage)
         tc = message.get("tool_calls", [])
+
         if not tc:
-            # No tool calls — final response
-            content = message.get("content", "")
+            # Final response — now re-request with streaming for live output
+            # Send any accumulated tool calls first
+            if tool_calls_log:
+                write_sse({"type": "tools", "tool_calls": tool_calls_log})
+
+            # Send reasoning if present
             reasoning = message.get("reasoning_content", "")
-            return {
-                "content": content,
-                "reasoning": reasoning,
-                "tool_calls": tool_calls_log,
-                "usage": usage,
-                "time": elapsed
-            }
+            if reasoning:
+                write_sse({"type": "reasoning", "content": reasoning})
 
-        # Execute tool calls
-        messages.append(message)  # Add assistant's tool call message
+            # Now stream the final text response
+            write_sse({"type": "stream_start"})
+            try:
+                stream_resp = call_model(messages, stream=True)
+                for line in stream_resp:
+                    line = line.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if delta.get("content"):
+                            write_sse({"type": "token", "content": delta["content"]})
+                        if delta.get("reasoning_content"):
+                            write_sse({"type": "reasoning_token", "content": delta["reasoning_content"]})
+                        # Check for usage in final chunk
+                        if chunk.get("usage"):
+                            total_usage = chunk["usage"]
+                    except json.JSONDecodeError:
+                        pass
+            except Exception as e:
+                # Streaming failed, fall back to the non-streamed content
+                content = message.get("content", "")
+                if content:
+                    write_sse({"type": "token", "content": content})
 
+            write_sse({"type": "done", "usage": total_usage, "time": elapsed})
+            return
+
+        # Tool calls — execute them and continue the loop
+        messages.append(message)
         for call in tc:
             fn = call.get("function", {})
             tool_name = fn.get("name", "")
@@ -298,6 +336,9 @@ def chat_with_tools(messages_history, image_data=None):
                 "args": tool_args,
                 "result": tool_result[:2000]
             })
+            # Send tool call live
+            write_sse({"type": "tool_exec", "tool": tool_name, "args": tool_args,
+                       "result": tool_result[:2000]})
 
             messages.append({
                 "role": "tool",
@@ -305,8 +346,7 @@ def chat_with_tools(messages_history, image_data=None):
                 "content": tool_result
             })
 
-    return {"content": "(max tool iterations reached)", "tool_calls": tool_calls_log,
-            "usage": {}, "time": 0}
+    write_sse({"type": "done", "usage": total_usage, "time": 0})
 
 
 def check_auth(cookie_header):
@@ -369,7 +409,10 @@ body { font-family: 'SF Mono','Fira Code','Consolas',monospace; background: var(
 .msg.assistant { background: var(--surface2); border: 1px solid var(--border); align-self: flex-start;
                  border-radius: 10px 10px 10px 2px; }
 .msg .thinking { color: var(--dim); font-size: 11px; font-style: italic; border-left: 2px solid var(--border);
-                 padding-left: 8px; margin-bottom: 6px; max-height: 100px; overflow-y: auto; }
+                 padding-left: 8px; margin-bottom: 6px; max-height: 150px; overflow-y: auto; }
+.msg .thinking.collapsed { max-height: 20px; overflow: hidden; cursor: pointer; }
+.msg .thinking-toggle { color: var(--dim); font-size: 10px; cursor: pointer; margin-bottom: 4px;
+                        user-select: none; }
 .msg .tool-call { background: rgba(0,0,0,0.3); border-radius: 6px; padding: 8px; margin: 6px 0;
                   font-size: 11px; border-left: 3px solid var(--orange); }
 .msg .tool-call .tool-name { color: var(--orange); font-weight: 600; }
@@ -505,7 +548,11 @@ function renderChat() {
       html += `<div class="msg user">${formatMsg(m.content)}${m.image ? '<br><span style="font-size:11px">&#128247; image attached</span>' : ''}</div>`;
     } else if (m.role === 'assistant') {
       html += `<div class="msg assistant">`;
-      if (m.reasoning) html += `<div class="thinking">${formatMsg(m.reasoning)}</div>`;
+      if (m.reasoning) {
+        const id = 'think-' + Math.random().toString(36).slice(2,8);
+        html += `<div class="thinking-toggle" onclick="document.getElementById('${id}').classList.toggle('collapsed')">&#9654; Reasoning (click to expand)</div>`;
+        html += `<div class="thinking collapsed" id="${id}">${formatMsg(m.reasoning)}</div>`;
+      }
       if (m.tool_calls?.length) {
         for (const tc of m.tool_calls) {
           html += `<div class="tool-call"><span class="tool-name">${tc.tool}</span>`;
@@ -540,7 +587,9 @@ async function send() {
     document.getElementById('img-preview').style.display = 'none';
   }
   messages.push(userMsg);
-  messages.push({ role: 'loading' });
+  // Add assistant placeholder
+  const assistant = { role: 'assistant', content: '', reasoning: '', tool_calls: [] };
+  messages.push(assistant);
   input.value = '';
   input.style.height = '40px';
   busy = true;
@@ -548,49 +597,99 @@ async function send() {
   renderChat();
 
   const t0 = performance.now();
+  let genStart = null;
+  let tokenCount = 0;
+  let reasoningTokens = 0;
+  let contentTokens = 0;
+  let toolCount = 0;
+
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: messages.filter(m => m.role !== 'loading') })
     });
-    const data = await resp.json();
-    const elapsed = (performance.now() - t0) / 1000;
 
-    // Remove loading
-    messages = messages.filter(m => m.role !== 'loading');
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
 
-    messages.push({
-      role: 'assistant',
-      content: data.content || '',
-      reasoning: data.reasoning || '',
-      tool_calls: data.tool_calls || []
-    });
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
 
-    // Update metrics
-    const u = data.usage || {};
-    const totalTok = u.completion_tokens || 0;
-    const promptTok = u.prompt_tokens || 0;
-    const tc = data.tool_calls || [];
-    const reasonLen = (data.reasoning || '').split(/\s+/).filter(w=>w).length;
-    const contentLen = (data.content || '').split(/\s+/).filter(w=>w).length;
-    const totalWords = reasonLen + contentLen;
-    const reasonTok = totalWords > 0 ? Math.round(totalTok * reasonLen / totalWords) : 0;
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
 
-    document.getElementById('m-gen').textContent = elapsed > 0 ? (totalTok / elapsed).toFixed(1) + ' t/s' : '-';
-    document.getElementById('m-ttft').textContent = data.time ? data.time.toFixed(1) + 's' : '-';
-    document.getElementById('m-reason').textContent = reasonTok;
-    document.getElementById('m-comp').textContent = totalTok - reasonTok;
-    document.getElementById('m-tools').textContent = tc.length;
-    document.getElementById('m-total').textContent = totalTok + ' tok';
-    document.getElementById('m-time').textContent = elapsed.toFixed(1) + 's';
-
-    // Refresh file tree after tool calls
-    if (tc.length > 0) loadTree();
-
+          if (evt.type === 'tool_exec') {
+            toolCount++;
+            assistant.tool_calls.push({ tool: evt.tool, args: evt.args, result: evt.result });
+            document.getElementById('m-tools').textContent = toolCount;
+            renderChat();
+          }
+          else if (evt.type === 'reasoning') {
+            assistant.reasoning = evt.content;
+            reasoningTokens = evt.content.split(/\s+/).filter(w=>w).length;
+            renderChat();
+          }
+          else if (evt.type === 'stream_start') {
+            genStart = performance.now();
+          }
+          else if (evt.type === 'reasoning_token') {
+            assistant.reasoning += evt.content;
+            reasoningTokens++;
+            tokenCount++;
+            document.getElementById('m-reason').textContent = reasoningTokens;
+            // Live speed update
+            if (genStart) {
+              const genElapsed = (performance.now() - genStart) / 1000;
+              document.getElementById('m-gen').textContent = genElapsed > 0.1 ? (tokenCount / genElapsed).toFixed(1) + ' t/s' : '...';
+            }
+            renderChat();
+          }
+          else if (evt.type === 'token') {
+            assistant.content += evt.content;
+            contentTokens++;
+            tokenCount++;
+            document.getElementById('m-comp').textContent = contentTokens;
+            document.getElementById('m-total').textContent = tokenCount + ' tok';
+            // Live speed update (only count gen time, not tool time)
+            if (genStart) {
+              const genElapsed = (performance.now() - genStart) / 1000;
+              document.getElementById('m-gen').textContent = genElapsed > 0.1 ? (tokenCount / genElapsed).toFixed(1) + ' t/s' : '...';
+            }
+            renderChat();
+          }
+          else if (evt.type === 'done') {
+            const u = evt.usage || {};
+            if (u.completion_tokens) {
+              tokenCount = u.completion_tokens;
+              document.getElementById('m-total').textContent = tokenCount + ' tok';
+            }
+            // Compute final gen speed excluding tool call time
+            if (genStart) {
+              const genElapsed = (performance.now() - genStart) / 1000;
+              document.getElementById('m-gen').textContent = genElapsed > 0.1 ? (tokenCount / genElapsed).toFixed(1) + ' t/s' : '-';
+              document.getElementById('m-ttft').textContent = ((genStart - t0) / 1000).toFixed(1) + 's';
+            }
+            const totalElapsed = (performance.now() - t0) / 1000;
+            document.getElementById('m-time').textContent = totalElapsed.toFixed(1) + 's';
+            if (toolCount > 0) loadTree();
+          }
+          else if (evt.type === 'error') {
+            assistant.content = evt.content;
+            renderChat();
+          }
+        } catch (e) {}
+      }
+    }
   } catch (e) {
-    messages = messages.filter(m => m.role !== 'loading');
-    messages.push({ role: 'assistant', content: 'Error: ' + e.message });
+    assistant.content = 'Error: ' + e.message;
   }
 
   busy = false;
@@ -677,8 +776,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/chat":
             data = json.loads(body)
-            result = chat_with_tools(data.get("messages", []))
-            self._json(result)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            def write_sse(event):
+                try:
+                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+            chat_with_tools_streaming(data.get("messages", []), write_sse)
+            return
         else:
             self.send_response(404); self.end_headers()
 

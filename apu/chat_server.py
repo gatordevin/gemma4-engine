@@ -232,9 +232,12 @@ def build_api_messages(messages_history):
                 ]})
             else:
                 messages.append({"role": "user", "content": m["content"]})
-        elif m["role"] == "assistant" and m.get("content"):
-            # Skip empty assistant messages (placeholders from frontend)
-            messages.append({"role": "assistant", "content": m["content"]})
+        elif m["role"] == "assistant":
+            # Skip empty placeholders, include messages with content or reasoning
+            content = m.get("content", "")
+            reasoning = m.get("reasoning", "")
+            if content or reasoning:
+                messages.append({"role": "assistant", "content": content or reasoning})
     return messages
 
 
@@ -258,16 +261,15 @@ def call_model(messages, stream=False):
 
 
 def chat_with_tools_streaming(messages_history, write_sse):
-    """Stream response via SSE. Handle tool calls in non-streaming mode, final response streamed."""
+    """Stream response via SSE. Uses non-streaming for tool detection, streaming for final."""
     messages = build_api_messages(messages_history)
     total_usage = {}
 
     for iteration in range(10):
         t0 = time.time()
 
-        # First try streaming — if model wants tool calls it won't stream properly,
-        # so we do non-streaming for tool detection
         try:
+            # Always use non-streaming first (simpler, more reliable)
             resp = call_model(messages, stream=False)
             result = json.loads(resp.read())
         except Exception as e:
@@ -275,49 +277,28 @@ def chat_with_tools_streaming(messages_history, write_sse):
             if hasattr(e, 'read'):
                 try: err_body = e.read().decode()[:500]
                 except: pass
-            print(f"[ERROR] Model call failed: {e} | body: {err_body}", flush=True)
-            print(f"[ERROR] Messages: {json.dumps(messages)[:500]}", flush=True)
-            write_sse({"type": "error", "content": f"Model error: {e} {err_body}"})
+            print(f"[ERROR] {e} | {err_body}", flush=True)
+            write_sse({"type": "error", "content": str(e)[:200]})
             return
 
+        elapsed = time.time() - t0
         choice = result.get("choices", [{}])[0]
         message = choice.get("message", {})
         total_usage = result.get("usage", total_usage)
         tc = message.get("tool_calls", [])
 
         if not tc:
-            # No tool calls — stream the response live
+            # No tool calls — send the response
             write_sse({"type": "stream_start"})
-            try:
-                stream_resp = call_model(messages, stream=True)
-                for raw_line in stream_resp:
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        if delta.get("content"):
-                            write_sse({"type": "token", "content": delta["content"]})
-                        if delta.get("reasoning_content"):
-                            write_sse({"type": "reasoning_token", "content": delta["reasoning_content"]})
-                        if chunk.get("usage"):
-                            total_usage = chunk["usage"]
-                    except json.JSONDecodeError:
-                        pass
-            except Exception:
-                # Streaming failed — send the non-streamed content
-                content = message.get("content", "")
-                reasoning = message.get("reasoning_content", "")
-                if reasoning:
-                    write_sse({"type": "reasoning_token", "content": reasoning})
-                if content:
-                    write_sse({"type": "token", "content": content})
-
-            elapsed = time.time() - t0
+            reasoning = message.get("reasoning_content", "")
+            content = message.get("content", "")
+            if reasoning:
+                # Send reasoning in small chunks to simulate streaming
+                for word in reasoning.split(" "):
+                    write_sse({"type": "reasoning_token", "content": word + " "})
+            if content:
+                for word in content.split(" "):
+                    write_sse({"type": "token", "content": word + " "})
             write_sse({"type": "done", "usage": total_usage, "time": elapsed})
             return
 
@@ -602,13 +583,14 @@ async function send() {
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: messages.filter(m => m.role === 'user' || (m.role === 'assistant' && m.content)) })
+      body: JSON.stringify({ messages: messages.filter(m => m.role === 'user' || (m.role === 'assistant' && (m.content || m.reasoning))) })
     });
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
 
+    const timeout = setTimeout(() => { busy = false; document.getElementById('send-btn').disabled = false; }, 120000);
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -666,7 +648,6 @@ async function send() {
               tokenCount = u.completion_tokens;
               document.getElementById('m-total').textContent = tokenCount + ' tok';
             }
-            // Compute final gen speed excluding tool call time
             if (genStart) {
               const genElapsed = (performance.now() - genStart) / 1000;
               document.getElementById('m-gen').textContent = genElapsed > 0.1 ? (tokenCount / genElapsed).toFixed(1) + ' t/s' : '-';
@@ -675,6 +656,13 @@ async function send() {
             const totalElapsed = (performance.now() - t0) / 1000;
             document.getElementById('m-time').textContent = totalElapsed.toFixed(1) + 's';
             if (toolCount > 0) loadTree();
+            // CRITICAL: break out of the reader loop
+            reader.cancel();
+            busy = false;
+            document.getElementById('send-btn').disabled = false;
+            renderChat();
+            document.getElementById('input').focus();
+            return;
           }
           else if (evt.type === 'error') {
             assistant.content = evt.content;
@@ -684,9 +672,10 @@ async function send() {
       }
     }
   } catch (e) {
-    assistant.content = 'Error: ' + e.message;
+    assistant.content += (assistant.content ? '\n' : '') + 'Error: ' + e.message;
   }
 
+  clearTimeout(timeout);
   busy = false;
   document.getElementById('send-btn').disabled = false;
   renderChat();

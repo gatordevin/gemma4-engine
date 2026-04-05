@@ -200,9 +200,9 @@ def chat_with_tools_streaming(messages_history, write_sse):
     total_prompt_tokens = 0
     total_prompt_ms = 0
 
-    # Use /completion endpoint with cache_prompt for KV cache reuse
-    # This gives ~80ms prompt eval on follow-up turns vs seconds with /chat
-    USE_COMPLETION_CACHE = True
+    # Use /v1/chat/completions for proper tool calling + reasoning separation
+    # The /completion endpoint has KV cache but breaks tool parsing
+    USE_COMPLETION_CACHE = False
 
     for iteration in range(10):
         if USE_COMPLETION_CACHE:

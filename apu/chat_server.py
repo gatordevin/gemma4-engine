@@ -52,10 +52,7 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "depth": {"type": "integer"}}}}}
 ]
 
-SYSTEM_PROMPT = f"""You are a helpful coding assistant with access to a project directory at {WORKDIR}.
-You can execute bash commands, read/write/edit files, and list directory contents.
-When the user asks you to write code or make changes, use the tools to actually create and modify files.
-Always show what you're doing and explain your changes. Be concise."""
+SYSTEM_PROMPT = f"""Coding assistant. Working dir: {WORKDIR}. Use tools to create/edit files and run commands. Be concise — output code directly, minimal explanation."""
 
 
 def resolve_path(path):
@@ -169,7 +166,7 @@ def chat_with_tools_streaming(messages_history, write_sse):
     """
     # Build API messages with sliding context window
     # Keep last MAX_TURNS turns to prevent prompt from growing too large
-    MAX_TURNS = 8  # 4 user + 4 assistant = ~2000 tokens of context max
+    MAX_TURNS = 4  # 2 user + 2 assistant — keeps context tight for fast iteration
 
     filtered = []
     for m in messages_history:
@@ -192,7 +189,7 @@ def chat_with_tools_streaming(messages_history, write_sse):
                 messages.append({"role": "user", "content": m["content"]})
         elif m["role"] == "assistant":
             # Truncate long assistant responses to save context
-            content = m["content"][:800] if len(m.get("content", "")) > 800 else m.get("content", "")
+            content = m["content"][:400] if len(m.get("content", "")) > 400 else m.get("content", "")
             messages.append({"role": "assistant", "content": content})
 
     write_sse({"type": "stream_start"})
@@ -208,7 +205,7 @@ def chat_with_tools_streaming(messages_history, write_sse):
         payload = {
             "model": "gemma",
             "messages": messages,
-            "max_tokens": 1024,
+            "max_tokens": 512,
             "temperature": 0.3,
             "tools": TOOLS,
             "stream": False,

@@ -195,29 +195,54 @@ def chat_with_tools_streaming(messages_history, write_sse):
     write_sse({"type": "stream_start"})
     t_wall_start = time.time()
 
-    # Accumulate server-side timings across iterations
     total_gen_tokens = 0
     total_gen_ms = 0
     total_prompt_tokens = 0
     total_prompt_ms = 0
 
+    # Use /completion endpoint with cache_prompt for KV cache reuse
+    # This gives ~80ms prompt eval on follow-up turns vs seconds with /chat
+    USE_COMPLETION_CACHE = True
+
     for iteration in range(10):
-        payload = {
-            "model": "gemma",
-            "messages": messages,
-            "max_tokens": 512,
-            "temperature": 0.3,
-            "tools": TOOLS,
-            "stream": False,
-        }
+        if USE_COMPLETION_CACHE:
+            # Format messages into Gemma 4 chat template
+            prompt = f"<bos><|turn>system\n{SYSTEM_PROMPT}\n\nTools: bash(command), read_file(path), write_file(path,content), edit_file(path,old_string,new_string), list_files(path). Call tools with native format.<turn|>\n"
+            for m in messages:
+                if m["role"] == "system":
+                    continue
+                elif m["role"] == "user":
+                    content = m["content"] if isinstance(m["content"], str) else str(m["content"])
+                    prompt += f"<|turn>user\n{content}<turn|>\n"
+                elif m["role"] == "assistant":
+                    prompt += f"<|turn>model\n{m['content']}<turn|>\n"
+                elif m["role"] == "tool":
+                    prompt += f"<|turn>user\n[Tool Result] {m['content'][:1000]}<turn|>\n"
+            prompt += "<|turn>model\n"
+
+            payload = {
+                "prompt": prompt,
+                "n_predict": 1024,
+                "temperature": 0.3,
+                "slot_id": 0,
+                "cache_prompt": True,
+                "stop": ["<turn|>", "<|turn>"],
+            }
+            api_url = f"{LLAMA_API}/completion"
+        else:
+            payload = {
+                "model": "gemma",
+                "messages": messages,
+                "max_tokens": 1024,
+                "temperature": 0.3,
+                "tools": TOOLS,
+                "stream": False,
+            }
+            api_url = f"{LLAMA_API}/v1/chat/completions"
 
         try:
-            req = Request(
-                f"{LLAMA_API}/v1/chat/completions",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
+            req = Request(api_url, data=json.dumps(payload).encode(),
+                          headers={"Content-Type": "application/json"}, method="POST")
             resp = urlopen(req, timeout=180)
             result = json.loads(resp.read())
         except Exception as e:
@@ -228,76 +253,99 @@ def chat_with_tools_streaming(messages_history, write_sse):
             write_sse({"type": "error", "content": f"Model error: {e} {err_body}"})
             return
 
-        choice = result.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        usage = result.get("usage", {})
-        timings = result.get("timings", {})
+        if USE_COMPLETION_CACHE:
+            timings = result.get("timings", {})
+            total_gen_tokens += result.get("tokens_predicted", 0)
+            total_gen_ms += timings.get("predicted_ms", 0)
+            total_prompt_tokens += timings.get("prompt_n", 0)
+            total_prompt_ms += timings.get("prompt_ms", 0)
 
-        # Accumulate server-side timings (actual generation, no overhead)
-        total_gen_tokens += timings.get("predicted_n", 0)
-        total_gen_ms += timings.get("predicted_ms", 0)
-        total_prompt_tokens += timings.get("prompt_n", 0)
-        total_prompt_ms += timings.get("prompt_ms", 0)
+            raw_content = result.get("content", "")
+            cached = result.get("tokens_cached", 0)
 
-        tc = message.get("tool_calls", [])
-
-        if tc:
-            messages.append(message)
-            for call in tc:
-                fn = call.get("function", {})
-                tool_name = fn.get("name", "")
-                try:
-                    tool_args = json.loads(fn.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    tool_args = {}
+            # Parse tool calls from raw output (Gemma native format)
+            import re
+            tool_match = re.search(r'<\|tool_call\>call:(\w+)\((.+)\)<tool_call\|>', raw_content)
+            if tool_match:
+                tool_name = tool_match.group(1)
+                args_str = tool_match.group(2)
+                tool_args = {}
+                for kv in re.finditer(r'(\w+)\s*[=:]\s*(?:"([^"]*?)"|\'([^\']*?)\'|(\S+?)(?:\s*[,\)]|$))', args_str):
+                    tool_args[kv.group(1)] = kv.group(2) or kv.group(3) or kv.group(4) or ""
 
                 tool_result = exec_tool(tool_name, tool_args)
                 write_sse({"type": "tool_exec", "tool": tool_name,
                            "args": tool_args, "result": tool_result[:2000]})
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.get("id", ""),
-                    "content": tool_result
-                })
-            continue
+                pre_text = raw_content[:tool_match.start()].strip()
+                messages.append({"role": "assistant", "content": pre_text})
+                messages.append({"role": "tool", "content": tool_result})
+                continue
 
-        # Final response — stream it
-        reasoning = message.get("reasoning_content", "")
-        content = message.get("content", "")
+            # No tool call — parse thinking and content
+            # Gemma wraps thinking in <|think>...<|/think> or thought blocks
+            thinking = ""
+            content = raw_content.strip()
 
-        if reasoning:
-            for word in reasoning.split(" "):
-                if word.strip():
-                    write_sse({"type": "reasoning_token", "content": word + " "})
+            # Clean special tokens
+            for tok in ['<bos>', '<channel|>', '<|channel>', '<tool_call|>', '<|tool_call>',
+                        '<|tool_response>', '<tool_response>']:
+                content = content.replace(tok, '')
 
-        if content:
-            for word in content.split(" "):
-                if word.strip():
-                    write_sse({"type": "token", "content": word + " "})
+            # Stream response
+            if content:
+                for word in content.split(" "):
+                    if word.strip():
+                        write_sse({"type": "token", "content": word + " "})
 
-        # Use server-side timings for accurate speed measurement
+        else:
+            # Original /chat endpoint path
+            choice = result.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            timings = result.get("timings", {})
+            total_gen_tokens += timings.get("predicted_n", 0)
+            total_gen_ms += timings.get("predicted_ms", 0)
+            total_prompt_tokens += timings.get("prompt_n", 0)
+            total_prompt_ms += timings.get("prompt_ms", 0)
+
+            tc = message.get("tool_calls", [])
+            if tc:
+                messages.append(message)
+                for call in tc:
+                    fn = call.get("function", {})
+                    tool_name = fn.get("name", "")
+                    try: tool_args = json.loads(fn.get("arguments", "{}"))
+                    except: tool_args = {}
+                    tool_result = exec_tool(tool_name, tool_args)
+                    write_sse({"type": "tool_exec", "tool": tool_name,
+                               "args": tool_args, "result": tool_result[:2000]})
+                    messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": tool_result})
+                continue
+
+            content = message.get("content", "")
+            reasoning = message.get("reasoning_content", "")
+            if reasoning:
+                for word in reasoning.split(" "):
+                    if word.strip():
+                        write_sse({"type": "reasoning_token", "content": word + " "})
+            if content:
+                for word in content.split(" "):
+                    if word.strip():
+                        write_sse({"type": "token", "content": word + " "})
+
+        # Done
         wall_time = time.time() - t_wall_start
         gen_tps = timings.get("predicted_per_second", 0)
         prompt_tps = timings.get("prompt_per_second", 0)
-
-        # Cumulative across all iterations (tool calls + final)
         cum_gen_tps = (total_gen_tokens / (total_gen_ms / 1000)) if total_gen_ms > 0 else 0
 
-        write_sse({"type": "done",
-                   "usage": usage,
-                   "time": wall_time,
-                   "gen_tps": gen_tps,
-                   "prompt_tps": prompt_tps,
-                   "cum_gen_tps": cum_gen_tps,
-                   "total_gen_tokens": total_gen_tokens,
-                   "total_gen_ms": total_gen_ms,
-                   "total_prompt_tokens": total_prompt_tokens,
-                   "total_prompt_ms": total_prompt_ms,
-                   })
+        write_sse({"type": "done", "usage": {"completion_tokens": total_gen_tokens},
+                   "time": wall_time, "gen_tps": gen_tps, "prompt_tps": prompt_tps,
+                   "cum_gen_tps": cum_gen_tps, "total_gen_tokens": total_gen_tokens,
+                   "total_gen_ms": total_gen_ms, "total_prompt_tokens": total_prompt_tokens,
+                   "total_prompt_ms": total_prompt_ms, "cached": cached if USE_COMPLETION_CACHE else 0})
         return
 
-    # Max iterations
     wall_time = time.time() - t_wall_start
     cum_gen_tps = (total_gen_tokens / (total_gen_ms / 1000)) if total_gen_ms > 0 else 0
     write_sse({"type": "done", "usage": {}, "time": wall_time,
@@ -403,7 +451,7 @@ input[type=file] { display: none; }
 <body>
 <div class="header">
   <h1>Gemma 4 26B-A4B</h1>
-  <div class="info">MoE 128e/8a | Q4_K_M | 54 t/s | Vision | Tools</div>
+  <div class="info">MoE 128e/8a | Q4_K_M | KV Cache | Tools</div>
 </div>
 <div class="metrics" id="metrics">
   <div class="metric"><span class="metric-label">Gen Speed:</span><span class="metric-value" id="m-gen">-</span></div>
@@ -413,6 +461,7 @@ input[type=file] { display: none; }
   <div class="metric"><span class="metric-label">Tools:</span><span class="metric-value" id="m-tools">0</span></div>
   <div class="metric"><span class="metric-label">Gen Tokens:</span><span class="metric-value" id="m-total">-</span></div>
   <div class="metric"><span class="metric-label">Gen Time:</span><span class="metric-value" id="m-gentime">-</span></div>
+  <div class="metric"><span class="metric-label">Cached:</span><span class="metric-value" id="m-cached" style="color:var(--yellow)">0</span></div>
   <div class="metric"><span class="metric-label">Wall:</span><span class="metric-value" id="m-time" style="color:var(--dim)">-</span></div>
 </div>
 <div class="main">
@@ -654,6 +703,9 @@ async function send() {
             }
             if (evt.total_gen_ms) {
               document.getElementById('m-gentime').textContent = (evt.total_gen_ms / 1000).toFixed(1) + 's';
+            }
+            if (evt.cached !== undefined) {
+              document.getElementById('m-cached').textContent = evt.cached;
             }
             const wallTime = (performance.now() - t0) / 1000;
             document.getElementById('m-time').textContent = wallTime.toFixed(1) + 's';

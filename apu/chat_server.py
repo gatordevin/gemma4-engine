@@ -40,79 +40,16 @@ Path(WORKDIR).mkdir(parents=True, exist_ok=True)
 valid_sessions = set()
 
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Execute a shell command and return its output. Use for running code, installing packages, git operations, etc.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The bash command to execute"}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read the contents of a file. Returns the file content as text.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file (relative to project root or absolute)"}
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file"},
-                    "content": {"type": "string", "description": "The content to write"}
-                },
-                "required": ["path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Replace a specific string in a file with new content. The old_string must match exactly.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file"},
-                    "old_string": {"type": "string", "description": "The exact string to find and replace"},
-                    "new_string": {"type": "string", "description": "The replacement string"}
-                },
-                "required": ["path", "old_string", "new_string"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "List files and directories in a path. Returns a tree structure.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory path (default: project root)"},
-                    "depth": {"type": "integer", "description": "Max depth (default: 3)"}
-                }
-            }
-        }
-    }
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read a file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write to a file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace text in a file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}}, "required": ["path", "old_string", "new_string"]}}},
+    {"type": "function", "function": {"name": "list_files", "description": "List directory contents",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "depth": {"type": "integer"}}}}}
 ]
 
 SYSTEM_PROMPT = f"""You are a helpful coding assistant with access to a project directory at {WORKDIR}.
@@ -230,10 +167,22 @@ def chat_with_tools_streaming(messages_history, write_sse):
     at 54 t/s with the A4B MoE model. Tool calls are executed in a loop,
     final text response is streamed word-by-word to the browser.
     """
-    # Build API messages
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Build API messages with sliding context window
+    # Keep last MAX_TURNS turns to prevent prompt from growing too large
+    MAX_TURNS = 8  # 4 user + 4 assistant = ~2000 tokens of context max
+
+    filtered = []
     for m in messages_history:
-        if m.get("role") == "user" and m.get("content"):
+        if m.get("role") in ("user", "assistant") and m.get("content"):
+            filtered.append(m)
+
+    # Truncate to last MAX_TURNS messages
+    if len(filtered) > MAX_TURNS:
+        filtered = filtered[-MAX_TURNS:]
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for m in filtered:
+        if m["role"] == "user":
             if m.get("image"):
                 messages.append({"role": "user", "content": [
                     {"type": "text", "text": m["content"]},
@@ -241,8 +190,10 @@ def chat_with_tools_streaming(messages_history, write_sse):
                 ]})
             else:
                 messages.append({"role": "user", "content": m["content"]})
-        elif m.get("role") == "assistant" and m.get("content"):
-            messages.append({"role": "assistant", "content": m["content"]})
+        elif m["role"] == "assistant":
+            # Truncate long assistant responses to save context
+            content = m["content"][:800] if len(m.get("content", "")) > 800 else m.get("content", "")
+            messages.append({"role": "assistant", "content": content})
 
     write_sse({"type": "stream_start"})
     t_wall_start = time.time()
@@ -257,7 +208,7 @@ def chat_with_tools_streaming(messages_history, write_sse):
         payload = {
             "model": "gemma",
             "messages": messages,
-            "max_tokens": 4096,
+            "max_tokens": 1024,
             "temperature": 0.3,
             "tools": TOOLS,
             "stream": False,
